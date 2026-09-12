@@ -1,0 +1,420 @@
+// sesscookie.nv — the cookie half: the identifier a store looks up, or
+// the whole session with no store at all.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// TWO KINDS OF SESSION COOKIE, AND THE DIFFERENCE IS WHERE THE DATA
+// IS.  An IDENTIFIER cookie carries a signed session identifier and
+// the data lives in a sessions.  A CLIENT-SIDE cookie carries the
+// serialised session itself, encrypted, and there is no store at all —
+// which is what Flask's `flask.session` does and what tower-sessions
+// does not.  Both go through cookie-nv, and this module is the policy
+// over it rather than a second cookie library.
+//
+// WHICH TO USE IS A REAL CHOICE, so both are published with their
+// costs stated rather than one being the default and the other a
+// footnote:
+//
+//   · An identifier cookie can be REVOKED — delete the record and the
+//     session is gone everywhere, immediately.  A client-side cookie
+//     cannot: the bytes are in the browser and the only revocation is
+//     rotating the key, which signs everybody out at once.
+//   · A client-side cookie needs no sessions, which is the whole appeal
+//     for a program with no database, a static-file host with a tiny
+//     API, or a service behind a load balancer with no shared state.
+//   · A client-side cookie has a 4096-byte CEILING, and going past it
+//     is the silent failure this module refuses to let happen quietly.
+//
+// THE CEILING IS A REFUSAL, NOT A WARNING.  RFC 6265 § 6.1 asks a
+// browser for at least 4096 bytes per cookie; every browser treats
+// that as the maximum and DISCARDS a larger one with no error
+// anywhere.  The next request arrives with no session, which from the
+// application's side looks exactly like the person logging out — and
+// it happens on the request that added the item that tipped it over.
+// `write_client` answers a `Result` and `SessCookieTooLarge` carries
+// both numbers, so the failure lands where the data was written rather
+// than one request later.
+//
+// THE ATTRIBUTES ARE NOT A DEFAULT ANYBODY SHOULD OVERRIDE CASUALLY.
+// `attrs` is `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, and the
+// `__Host-` prefix — and cookie-nv's `check_attrs` refuses the five
+// combinations a browser silently ignores.  `SameSite=Lax` rather than
+// `Strict` because `Strict` drops the cookie on a cross-site
+// navigation, which means arriving from an external link leaves a
+// signed-in person looking signed out; `Lax` keeps it on a top-level
+// GET and drops it on a cross-site POST, which is the CSRF case.
+
+use cookieattr
+use cookieseal
+use civil
+use sess
+use sesserr
+use sessid
+
+// How a session travels in a cookie.
+pub enum SessCookieKind
+    // The identifier, signed.  The data is in a sessions, and deleting
+    // the record revokes the session everywhere at once.
+    SessCookieId
+    // The whole session, encrypted.  No store; no revocation short of
+    // rotating the key; a 4096-byte ceiling.
+    SessCookieClient
+
+// A session cookie's configuration.
+pub struct SessCookie
+    // The cookie's name.  `__Host-sid` by default — the `__Host-`
+    // prefix is the only host-locking cookies have, and it is why
+    // `attrs` has no `Domain` and a `Path` of exactly `/`.
+    name: Str
+    // Identifier or client-side.
+    kind: SessCookieKind
+    // The attributes, which cookie-nv checks.
+    attrs: cookieattr.CookieAttrs
+    // The signing or encryption keys, newest first.  A list rather
+    // than one key because rotation has to be possible without signing
+    // everybody out: a new key is pushed on the front, the old ones
+    // keep verifying, and they are dropped when nothing is signed with
+    // them any more.
+    keys: cookieseal.CookieKeys
+
+// The conventional identifier cookie: `__Host-sid`, `HttpOnly`,
+// `Secure`, `SameSite=Lax`, `Path=/`.
+//
+// The `__Host-` prefix is the interesting part.  It is the only
+// host-locking cookies have: a browser refuses a `__Host-` cookie that
+// carries a `Domain` or a `Path` other than `/`, which means the
+// cookie cannot be set by a sibling subdomain.  Without it, anything
+// that can get JavaScript onto `blog.example.com` can set a session
+// cookie for `app.example.com` — which is session fixation with a
+// different entry point.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     println(sesscookie.defaults(k).name)
+// ```
+pub fn defaults(keys: cookieseal.CookieKeys) -> SessCookie []
+    todo("session-nv.sesscookie.defaults")
+
+// A client-side session cookie: the same attributes, the whole session
+// encrypted into the value.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     println("${sesscookie.is_client_side(sesscookie.client_side(k))}")
+// ```
+pub fn client_side(keys: cookieseal.CookieKeys) -> SessCookie []
+    todo("session-nv.sesscookie.client_side")
+
+// The same cookie under another name.
+//
+// Refuses a name whose prefix contradicts the attributes — a
+// `__Host-` name on a cookie with a `Domain`, a `__Secure-` name
+// without `Secure` — which is cookie-nv's `check_attrs` and is the
+// check that stops a cookie a browser ignores from looking correct.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     match sesscookie.with_name(sesscookie.defaults(k), "__Host-app-session")
+//         Ok(c)  => println(c.name)
+//         Err(_) => println("that name and those attributes disagree")
+// ```
+pub fn with_name(c: SessCookie, name: Str) -> Result<SessCookie, sesserr.SessFault> []
+    todo("session-nv.sesscookie.with_name")
+
+// The same cookie with attributes the caller chose.
+//
+// Refuses any combination a browser silently ignores, which is
+// cookie-nv's `check_attrs`.  A session cookie is exactly the cookie
+// where being silently ignored looks like "people keep getting logged
+// out" rather than like a bug.
+//
+// ```novo
+// use cookieattr
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     match sesscookie.with_attrs(sesscookie.defaults(k), cookieattr.defaults())
+//         Ok(_)  => println("accepted")
+//         Err(_) => println("a browser would ignore that cookie")
+// ```
+pub fn with_attrs(c: SessCookie,
+                  a: cookieattr.CookieAttrs) -> Result<SessCookie, sesserr.SessFault> []
+    todo("session-nv.sesscookie.with_attrs")
+
+// Whether this cookie carries the session itself.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     println("${sesscookie.is_client_side(sesscookie.defaults(k))}")
+// ```
+pub fn is_client_side(c: SessCookie) -> Bool []
+    todo("session-nv.sesscookie.is_client_side")
+
+// Every attribute problem with this cookie, as cookie-nv reports them.
+//
+// Answers all of them rather than the first, because a cookie built
+// wrongly usually has two attributes wrong and fixing one at a time is
+// two deploys.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+// use std.list
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     println("${list.len(sesscookie.problems(sesscookie.defaults(k)))}")
+// ```
+pub fn problems(c: SessCookie) -> [cookieattr.CookieError] []
+    todo("session-nv.sesscookie.problems")
+
+// ── Reading ──────────────────────────────────────────────────────────
+
+// The session identifier a request's `Cookie` header carries.
+//
+// Takes the RAW header — what `HttpRequest` holds — and verifies the
+// signature.  `None` where there is no such cookie, which is the
+// ordinary first visit.  A fault where a cookie IS there and did not
+// verify: a rotated key whose predecessor was dropped, a cookie from
+// another deployment, or somebody editing it.  `sesserr.means_no_session`
+// is what turns that into "send them to the sign-in page" rather than
+// a 500.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     match sesscookie.read_id(sesscookie.defaults(k), "__Host-sid=abc.def")
+//         Ok(some_id) => println("a cookie was there")
+//         Err(_)      => println("a cookie was there and did not verify")
+// ```
+pub fn read_id(c: SessCookie, cookie_header: Str) -> Result<?sessid.SessId, sesserr.SessFault> []
+    todo("session-nv.sesscookie.read_id")
+
+// The whole session a client-side cookie carries, decrypted.
+//
+// `now` is what the expiry is checked against, so a cookie whose
+// session has expired answers `None` rather than a session a handler
+// then has to check.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use sess
+// use civil
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     match sesscookie.read_client(sesscookie.client_side(k), "__Host-sid=x",
+//                                  sess.defaults(), at)
+//         Ok(_)  => println("read")
+//         Err(_) => println("that cookie did not verify")
+// ```
+pub fn read_client(c: SessCookie, cookie_header: Str, p: sess.SessPolicy,
+                   now: civil.CivilDateTime) -> Result<?sess.Sess, sesserr.SessFault> []
+    todo("session-nv.sesscookie.read_client")
+
+// Which key verified a cookie, as an index into the key list.
+//
+// The state a single-key API cannot be in, and the one an operator
+// needs during a rotation: a deployment can watch the proportion of
+// requests still verifying against the OLD key and drop it when that
+// reaches zero, rather than guessing.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     match sesscookie.verified_by(sesscookie.defaults(k), "__Host-sid=abc.def")
+//         Some(i) => println("${i}")
+//         None    => println("nothing verified it")
+// ```
+pub fn verified_by(c: SessCookie, cookie_header: Str) -> ?Int []
+    todo("session-nv.sesscookie.verified_by")
+
+// ── Writing ──────────────────────────────────────────────────────────
+
+// The `Set-Cookie` line for a session identifier.
+//
+// The `Max-Age` comes from the policy and the session, so a cookie's
+// lifetime and a record's expiry cannot drift apart.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use sess
+// use sessid
+// use civil
+// use uuid
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     let s = sess.fresh(sessid.of_uuid(uuid.nil()), at)
+//     match sesscookie.write_id(sesscookie.defaults(k), s, sess.defaults())
+//         Ok(line) => println(line)
+//         Err(_)   => println("refused")
+// ```
+pub fn write_id(c: SessCookie, s: sess.Sess,
+                p: sess.SessPolicy) -> Result<Str, sesserr.SessFault> []
+    todo("session-nv.sesscookie.write_id")
+
+// The `Set-Cookie` line for a client-side session, encrypted.
+//
+// **Refuses a session too large for a browser to keep**, with both
+// numbers in the fault.  The alternative is a cookie the browser
+// discards in silence and a person who appears to have logged out on
+// the request that added one item too many.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use sess
+// use sessid
+// use civil
+// use uuid
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     let s = sess.fresh(sessid.of_uuid(uuid.nil()), at)
+//     match sesscookie.write_client(sesscookie.client_side(k), s, sess.defaults())
+//         Ok(line) => println(line)
+//         Err(_)   => println("that session will not fit in a cookie")
+// ```
+pub fn write_client(c: SessCookie, s: sess.Sess,
+                    p: sess.SessPolicy) -> Result<Str, sesserr.SessFault> []
+    todo("session-nv.sesscookie.write_client")
+
+// How many bytes a client-side session's cookie would take.
+//
+// The question to ask BEFORE writing, so a handler storing something
+// large can decide to put it in a store instead.  Counts the whole
+// `Set-Cookie` value after encryption and encoding, because that is
+// what a browser measures.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use sess
+// use sessid
+// use civil
+// use uuid
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     let s = sess.fresh(sessid.of_uuid(uuid.nil()), at)
+//     println("${sesscookie.client_bytes(sesscookie.client_side(k), s)}")
+// ```
+pub fn client_bytes(c: SessCookie, s: sess.Sess) -> Int []
+    todo("session-nv.sesscookie.client_bytes")
+
+// The browser's per-cookie ceiling: 4096.
+//
+// Published so a test asserts the number rather than trusting a
+// paragraph, and so a deployment behind a proxy with a smaller header
+// budget can compare against its own.
+//
+// ```novo
+// use sesscookie
+//
+// fn main() [io]
+//     println("${sesscookie.cookie_ceiling()}")
+// ```
+pub fn cookie_ceiling() -> Int []
+    todo("session-nv.sesscookie.cookie_ceiling")
+
+// The `Set-Cookie` line that ends a session: an empty value and an
+// expiry in the past.
+//
+// Every attribute must match the cookie that was set, or the browser
+// deletes nothing and keeps the session — which is a sign-out that
+// silently did not happen.  Building it here rather than in each
+// caller is what keeps them matching.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     match sesscookie.write_deletion(sesscookie.defaults(k))
+//         Ok(line) => println(line)
+//         Err(_)   => println("refused")
+// ```
+pub fn write_deletion(c: SessCookie) -> Result<Str, sesserr.SessFault> []
+    todo("session-nv.sesscookie.write_deletion")
+
+// ── Key rotation ─────────────────────────────────────────────────────
+
+// The same cookie with a new key on the front.
+//
+// Everything still verifies against the old keys, and new cookies are
+// signed with the new one — which is what makes a rotation something
+// other than signing everybody out at once.  `verified_by` is how a
+// deployment watches the old key fall out of use before dropping it.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let c = sesscookie.rotate_key(sesscookie.defaults(k),
+//                                   bytes.from_byte_list([4, 5, 6]))
+//     println("${sesscookie.key_count(c)}")
+// ```
+pub fn rotate_key(c: SessCookie, newest: Bytes) -> SessCookie []
+    todo("session-nv.sesscookie.rotate_key")
+
+// How many keys this cookie will verify against.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     println("${sesscookie.key_count(sesscookie.defaults(k))}")
+// ```
+pub fn key_count(c: SessCookie) -> Int []
+    todo("session-nv.sesscookie.key_count")

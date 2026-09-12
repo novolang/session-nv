@@ -1,0 +1,251 @@
+// sessid.nv — the identifier, minted so nobody can guess it and
+// compared so nobody can measure it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// TWO FUNCTIONS PERFORM AND THE REST DO NOT.  `new` and `new_wide`
+// read the operating system's generator, which on this platform is the
+// device `/dev/urandom`, so they cost `[fs, rand]`.  Everything else —
+// parsing, printing, comparing, checking — is `[]`, which is what lets
+// every rule in this module be a test with nothing installed.
+//
+// `[fs]` ON MINTING IS THE HONEST ROW.  The standard library's `rand`
+// module is xoshiro256**: a fine shuffle and a terrible session
+// identifier, because an observer who sees two outputs can compute the
+// rest.  A predictable session identifier is not "weaker security" —
+// it is every account on the deployment.  So minting goes through the
+// operating system's generator, and reading a device is `[fs]`.
+//
+// WHY THE COMPARISON IS NOT `==`.  A session identifier arrives from a
+// request, which means an attacker chooses it, which means the time a
+// comparison takes is a measurement they can make.  A byte-by-byte
+// comparison that stops at the first difference turns guessing a
+// 122-bit identifier from 2^122 work into about 16 × 256 measurements.
+// `id_eq` is `digest.ct_eq` and nothing else, and the store lookups
+// in `sessstore` use it.
+//
+// 122 BITS OR 256.  A version 4 UUID has 122 unpredictable bits: six
+// of its 128 are the version and variant fields, and they are FIXED.
+// That is comfortably above what a session needs and it is what
+// `new` mints, because a UUID is also a thing a person recognises in
+// a log.  `new_wide` is 256 bits for the deployment where a stolen
+// session is worth somebody's afternoon; it prints as base64url and
+// is not a UUID.
+
+use uuid
+use sesserr
+
+// A session identifier.
+//
+// Opaque on purpose: a caller never builds one from a string it
+// composed, because the whole property this type carries is that its
+// value came from a generator.  `parse` is how one arrives from a
+// request, and it CHECKS rather than trusting.
+pub struct SessId
+    // The printed form: a UUID's 36 characters, or `new_wide`'s 43
+    // base64url characters.  Held as text because that is what goes in
+    // a cookie and what comes back out of one.
+    text: Str
+
+// Mint an identifier from the operating system's generator: a version
+// 4 UUID, 122 unpredictable bits.
+//
+// `SessBadId` where there is no generator — a deployment refuses to
+// issue sessions rather than issuing guessable ones, because a session
+// identifier an attacker can predict is every session on the machine.
+//
+// ```novo
+// use sessid
+//
+// // Minting reads the operating system's generator, which is beyond
+// // [io], so the example writes its own `main`.
+// fn main() [io, fs, rand]
+//     match sessid.new()
+//         Ok(id) => println("${str.len(sessid.text_of(id))}")
+//         Err(_) => println("no generator on this machine")
+// ```
+pub fn new() -> Result<SessId, sesserr.SessFault> [fs, rand]
+    todo("session-nv.sessid.new")
+
+// Mint a 256-bit identifier, printed as 43 base64url characters.
+//
+// For the deployment where a stolen session is worth somebody's
+// afternoon.  A version 4 UUID's 122 bits are what it has — six of its
+// 128 are fixed fields — and no amount of caring makes them more.
+//
+// ```novo
+// use sessid
+//
+// fn main() [io, fs, rand]
+//     match sessid.new_wide()
+//         Ok(id) => println("${str.len(sessid.text_of(id))}")
+//         Err(_) => println("no generator on this machine")
+// ```
+pub fn new_wide() -> Result<SessId, sesserr.SessFault> [fs, rand]
+    todo("session-nv.sessid.new_wide")
+
+// An identifier from bytes the caller brought.
+//
+// `[]`, and that is what makes every test in this package fixed: the
+// same session is minted twice and the assertions are exact.  Also for
+// a deployment whose entropy comes from somewhere this package does
+// not know about — a hardware token, a key management service.
+//
+// Refuses fewer than 16 bytes: below that the identifier is guessable
+// and the refusal is the point.
+//
+// ```novo
+// use std.bytes
+// use sessid
+//
+// fn main() [io]
+//     match sessid.of_bytes(bytes.from_byte_list([1, 2, 3]))
+//         Ok(_)  => println("minted")
+//         Err(_) => println("not enough bytes to be unguessable")
+// ```
+pub fn of_bytes(raw: Bytes) -> Result<SessId, sesserr.SessFault> []
+    todo("session-nv.sessid.of_bytes")
+
+// An identifier as it arrived from a request, CHECKED.
+//
+// A cookie's value is text an attacker chooses.  This refuses anything
+// that is not a shape this package mints — the wrong length, a byte
+// outside the alphabet — so a store is never asked to look up a path
+// segment, a wildcard or a thousand-character string.
+//
+// It is not a security boundary by itself: an identifier that parses
+// is still one nobody issued, and the store's `None` is what answers
+// that.  It is the cheap check that keeps rubbish out of the store's
+// key space.
+//
+// ```novo
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("../../etc/passwd")
+//         Some(_) => println("that is not an identifier")
+//         None    => println("refused")
+// ```
+pub fn parse(text: Str) -> ?SessId []
+    todo("session-nv.sessid.parse")
+
+// The printed form, for a cookie or a log.
+//
+// A session identifier in a log is a credential in a log.  Prefer
+// `short_of` where the purpose is correlation rather than lookup.
+//
+// ```novo
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) => println(sessid.text_of(id))
+// ```
+pub fn text_of(id: SessId) -> Str []
+    todo("session-nv.sessid.text_of")
+
+// The first eight characters, for correlating log lines without
+// putting the credential in them.
+//
+// Published rather than left to each caller, because the caller who
+// writes their own writes `text_of` and means to shorten it later.
+//
+// ```novo
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) => println(sessid.short_of(id))
+// ```
+pub fn short_of(id: SessId) -> Str []
+    todo("session-nv.sessid.short_of")
+
+// Whether two identifiers are the same, compared in CONSTANT TIME.
+//
+// The one comparison in this package that may not be `==`.  One of the
+// two arrived in a request, so an attacker chooses it and can measure
+// how long the answer took; a comparison that stops at the first
+// differing byte turns guessing a 122-bit identifier into about
+// sixteen rounds of 256 measurements.
+//
+// ```novo
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) => println("${sessid.id_eq(id, id)}")
+// ```
+pub fn id_eq(a: SessId, b: SessId) -> Bool []
+    todo("session-nv.sessid.id_eq")
+
+// Whether an identifier is the UUID shape `new` mints, rather than
+// `new_wide`'s.
+//
+// For a deployment migrating from one to the other, which wants to
+// know which of its live sessions are still on the narrow form.
+//
+// ```novo
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) => println("${sessid.is_uuid(id)}")
+// ```
+pub fn is_uuid(id: SessId) -> Bool []
+    todo("session-nv.sessid.is_uuid")
+
+// The identifier as a uuid-nv value, where it is one.
+//
+// For a caller that stores sessions in a database whose primary key is
+// a UUID column.  `None` for a `new_wide` identifier, which is not a
+// UUID and does not pretend to be.
+//
+// ```novo
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) =>
+//             match sessid.as_uuid(id)
+//                 Some(_) => println("a UUID")
+//                 None    => println("a wide identifier")
+// ```
+pub fn as_uuid(id: SessId) -> ?uuid.Uuid []
+    todo("session-nv.sessid.as_uuid")
+
+// A uuid-nv value as a session identifier.
+//
+// The other direction, for a caller reading one out of a database
+// column.
+//
+// ```novo
+// use uuid
+// use sessid
+//
+// fn main() [io]
+//     println(sessid.text_of(sessid.of_uuid(uuid.nil())))
+// ```
+pub fn of_uuid(id: uuid.Uuid) -> SessId []
+    todo("session-nv.sessid.of_uuid")
+
+// How many unpredictable bits an identifier carries: 122 for the UUID
+// form, 256 for the wide one.
+//
+// Published so a deployment's own audit can assert it rather than
+// trusting a sentence in a README.
+//
+// ```novo
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) => println("${sessid.entropy_bits(id)}")
+// ```
+pub fn entropy_bits(id: SessId) -> Int []
+    todo("session-nv.sessid.entropy_bits")

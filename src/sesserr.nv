@@ -1,0 +1,159 @@
+// sesserr.nv — what can go wrong with a session, and the one answer
+// that is deliberately not an error.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// "NO SUCH SESSION" IS NOT IN THIS ENUM, on purpose.  A store's read
+// answers `?SessRecord`, and `None` covers three cases a caller must
+// not be able to tell apart: the identifier was never issued, the
+// record expired, and the record was deleted.  Distinguishing them
+// would make the store an ORACLE — an attacker with a guessed
+// identifier learns whether it was ever real, which is one bit per
+// guess against a space a library exists to make unguessable.
+//
+// So the enum below is about things that went WRONG: a disk that would
+// not write, a cookie whose signature did not verify, a payload too
+// large for a browser to keep.  A session that is simply not there is
+// the ordinary path, and it answers `None`.
+//
+// THE 4096-BYTE CEILING DESERVES ITS OWN VARIANT.  RFC 6265 § 6.1 asks
+// a browser for at least 4096 bytes per cookie, and every browser
+// treats it as a maximum.  A cookie session that grows past it is
+// DROPPED — silently, by the browser, with no error anywhere — and the
+// next request arrives with no session at all.  From the application's
+// side that is indistinguishable from a person logging out, and it
+// happens on exactly the request that added the last item to a cart.
+// `SessCookieTooLarge` is where that becomes visible, at the moment of
+// writing rather than on the request after.
+
+// Everything that goes wrong with a session.
+pub enum SessFault
+    // The store could not be read: a disk, a socket, a permission.
+    // The detail is for a log.
+    SessStoreUnreadable(detail: Str)
+    // The store could not be written.  The one a caller must not
+    // swallow: a save that silently failed is a sign-in that appears
+    // to work and does not survive the redirect.
+    SessStoreUnwritable(detail: Str)
+    // A record was read and was not the shape this package writes —
+    // a truncated file, a half-written row, a value from an older
+    // release with a field this one cannot read.
+    SessRecordUnreadable(detail: Str)
+    // The cookie's signature or its authenticated encryption did not
+    // verify.  The ordinary causes are a rotated key whose predecessor
+    // was dropped and a cookie from another deployment; the
+    // interesting cause is somebody editing it.  Treated as "no
+    // session" by the middleware, and reported here so a deployment
+    // can count them.
+    SessCookieUnsealed(name: Str)
+    // A client-side session serialised to more than a browser will
+    // keep.  Carries both numbers so a log says how far over.
+    SessCookieTooLarge(bytes: Int, ceiling: Int)
+    // A cookie session was asked for and no key was supplied.
+    // Refused rather than defaulted: a session cookie with no
+    // signature is a session anybody can write.
+    SessNoKey
+    // An identifier that is not one this package would mint: the
+    // wrong length, a byte outside the alphabet.  A request carrying
+    // one is a probe, not a client.
+    SessBadId(detail: Str)
+    // The session's absolute lifetime is shorter than its idle
+    // timeout, so a session would expire before it could ever be
+    // refreshed.  A configuration that cannot do anything, caught
+    // where it is written rather than in production at 3am.
+    SessPolicyImpossible(detail: Str)
+    // A store that does not do what was asked — a sweep on a store
+    // with no index, a rotation on one that cannot delete.  Names the
+    // operation so a caller can pick another sessions.
+    SessUnsupported(operation: Str)
+
+// The standard `Error` implementation, so a failed session is reported
+// by anything that reports errors.
+impl Error for SessFault
+    // The one line: what was being done, what refused, and — for the
+    // cookie ceiling — the two numbers, because "too large" without
+    // them tells a deployment nothing it can act on.
+    fn message(self) -> Str
+        todo("session-nv.sesserr.SessFault.message")
+
+// Whether the same operation could succeed if it were tried again.
+//
+// True for a store that was momentarily unreachable; false for
+// everything about the shape of the data or the configuration.
+//
+// ```novo
+// use sesserr
+//
+// fn main() [io]
+//     println("${sesserr.is_retryable(sesserr.SessStoreUnreadable("timeout"))}")
+// ```
+pub fn is_retryable(f: SessFault) -> Bool []
+    todo("session-nv.sesserr.is_retryable")
+
+// Whether this is a deployment that is wrong rather than a request
+// that failed.
+//
+// True for a missing key, an impossible policy and an unsupported
+// operation — the three a restart will not fix and a person has to.
+//
+// ```novo
+// use sesserr
+//
+// fn main() [io]
+//     println("${sesserr.is_configuration_fault(sesserr.SessNoKey)}")
+// ```
+pub fn is_configuration_fault(f: SessFault) -> Bool []
+    todo("session-nv.sesserr.is_configuration_fault")
+
+// Whether the middleware should treat this as "no session" and carry
+// on, rather than answering an error.
+//
+// True for `SessCookieUnsealed` and `SessBadId`, and the reasoning is
+// the whole of it: a request carrying an unreadable session cookie is
+// a request from somebody who should be sent to a sign-in page, not a
+// request that deserves a 500.  A deployment that rotated its signing
+// key would otherwise answer 500 to every returning visitor at once.
+//
+// Counted rather than hidden: `sessmw` reports them so an operator can
+// tell a key rotation from an attack by the shape of the graph.
+//
+// ```novo
+// use sesserr
+//
+// fn main() [io]
+//     println("${sesserr.means_no_session(sesserr.SessCookieUnsealed("sid"))}")
+// ```
+pub fn means_no_session(f: SessFault) -> Bool []
+    todo("session-nv.sesserr.means_no_session")
+
+// The HTTP status a handler should answer when a fault reaches it.
+//
+// Published because two handlers deciding this separately will
+// disagree, and because the wrong answer is expensive in both
+// directions: a 500 for an unsealed cookie tells a monitoring system
+// the application is broken when a key was rotated, and a 200 for a
+// failed WRITE tells a person they are signed in when they are not.
+//
+// ```novo
+// use sesserr
+//
+// fn main() [io]
+//     println("${sesserr.status_for(sesserr.SessStoreUnwritable("disk full"))}")
+// ```
+pub fn status_for(f: SessFault) -> Int []
+    todo("session-nv.sesserr.status_for")
+
+// Whether the fault's text may be shown to an end user.
+//
+// False for every variant carrying a store's detail string, which can
+// name a path, a host or a query.  A person who could not sign in
+// needs "something went wrong"; the detail belongs in the log.
+//
+// ```novo
+// use sesserr
+//
+// fn main() [io]
+//     println("${sesserr.is_client_safe(sesserr.SessStoreUnreadable("/var/lib/x"))}")
+// ```
+pub fn is_client_safe(f: SessFault) -> Bool []
+    todo("session-nv.sesserr.is_client_safe")

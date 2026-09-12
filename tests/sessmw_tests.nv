@@ -1,0 +1,243 @@
+// sessmw_tests.nv — the two halves an application mounts, and the
+// faults an application decides about.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: session-nv.<module>.<fn>`.
+//
+// THE ROWS ON THESE TESTS ARE THE POINT AGAIN.  Every function that
+// touches a store here names `[io, mutate]`, because the store is
+// `SessMemory` and the effect parameter charges the caller exactly
+// that.  A test mounting `SessFiles` would name `[io, fs]` on the same
+// calls.
+
+use std.test
+use std.bytes
+use std.list
+use std.str
+use civil
+use uuid
+use cookieseal
+use sess
+use sesserr
+use sesscookie
+use sessid
+use sessmw
+use sessstore
+
+fn a_key() -> cookieseal.CookieKeys
+    cookieseal.one_key(bytes.from_byte_list(list.range(0, 32)))
+
+fn t0() -> civil.CivilDateTime
+    civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+
+fn an_id() -> sessid.SessId
+    sessid.of_uuid(uuid.nil())
+
+fn another_id() -> sessid.SessId
+    sessid.of_uuid(uuid.max())
+
+fn opts() -> sessmw.SessOptions
+    sessmw.options(sesscookie.defaults(a_key()))
+
+@test
+fn test_a_session_is_not_created_for_every_visitor_by_default() [io]
+    // A public page that creates a session for every visitor creates
+    // one for every crawler too, and a deployment discovers this as a
+    // store growing by a million empty rows a week.
+    test.case("eager creation is off")
+    test.assert(not opts().create_eagerly)
+
+    test.case("and turning it on is something a caller says out loud")
+    test.assert(sessmw.eager(opts()).create_eagerly)
+
+@test
+fn test_a_policy_that_cannot_work_is_refused_where_it_is_configured() [io]
+    test.case("an hour of idle inside ten minutes of life")
+    match sessmw.with_policy(opts(), sess.policy(3600, 600))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("the ordinary way round")
+    match sessmw.with_policy(opts(), sess.policy(1800, 43200))
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert(true)
+
+@test
+fn test_a_load_costs_what_the_store_costs_and_no_more() [io, mutate]
+    // `[io, mutate]` on this test is the compiler agreeing.  No `[fs]`,
+    // no `[net]`, for a memory sessions.
+    test.case("a first visit with no cookie")
+    let sessions = sessstore.memory(100)
+    match sessmw.load(sessions, opts(), "", an_id(), t0())
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            match l
+                SessNew(_)        => test.assert(true)
+                SessFound(_)      => test.assert(false)
+                SessExpired(_, _) => test.assert(false)
+
+@test
+fn test_the_three_load_answers_are_three_different_pages() [io, mutate]
+    // A middleware that collapsed "expired" into "new" cannot tell a
+    // person "your session timed out" from "hello".
+    let sessions = sessstore.memory(100)
+
+    test.case("a fresh session is carried whichever answer it was")
+    match sessmw.load(sessions, opts(), "", an_id(), t0())
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            test.assert(sess.len(sessmw.session_of(l)) == 0)
+
+            test.case("and a first visit has no expiry reason")
+            test.assert_eq_str(sessmw.expiry_reason_of(l), "")
+
+@test
+fn test_a_cookie_that_did_not_verify_is_a_new_session_and_a_counted_fault() [io, mutate]
+    // A deployment that rotated its signing key would otherwise answer
+    // 500 to every returning visitor at once.  The fault is still
+    // reported, so an operator can tell a rotation from an attack by
+    // the shape of the graph.
+    test.case("the request carries on")
+    let sessions = sessstore.memory(100)
+    match sessmw.load(sessions, opts(), "__Host-sid=forged.value", an_id(), t0())
+        Err(_) => test.assert(false)
+        Ok(l)  =>
+            match l
+                SessNew(_)        => test.assert(true)
+                SessFound(_)      => test.assert(false)
+                SessExpired(_, _) => test.assert(false)
+
+    test.case("and the fault is countable")
+    let faults = sessmw.load_faults(opts(), "__Host-sid=forged.value")
+    test.assert(list.len(faults) == 1)
+
+    test.case("a request with no cookie has nothing to count")
+    test.assert(list.len(sessmw.load_faults(opts(), "")) == 0)
+
+@test
+fn test_the_middleware_treats_an_unsealed_cookie_as_no_session() [io]
+    test.case("which is what `means_no_session` says")
+    test.assert(sesserr.means_no_session(sesserr.SessCookieUnsealed("__Host-sid")))
+    test.assert(sesserr.means_no_session(sesserr.SessBadId("wrong length")))
+
+    test.case("and a store that would not write is NOT that")
+    test.assert(not sesserr.means_no_session(sesserr.SessStoreUnwritable("disk full")))
+
+@test
+fn test_an_unchanged_session_writes_nothing_and_sends_no_cookie() [io, mutate]
+    // The performance story: the overwhelming majority of requests
+    // read a session and change nothing, and a middleware that wrote
+    // unconditionally would put a store write on every page view.
+    test.case("a loaded, untouched session")
+    let sessions = sessstore.memory(100)
+    match sess.of_record(sess.to_record(sess.fresh(an_id(), t0()), sess.defaults(), t0()))
+        Err(_)     => test.assert(false)
+        Ok(loaded) =>
+            match sessmw.save(sessions, opts(), loaded, t0())
+                Err(_)  => test.assert(false)
+                Ok(out) =>
+                    test.assert(not out.stored)
+                    test.assert(not sessmw.has_cookie(out))
+
+@test
+fn test_a_changed_session_is_written_and_carries_a_cookie() [io, mutate]
+    test.case("a set makes it dirty, and the save writes")
+    let sessions = sessstore.memory(100)
+    let s = sess.set(sess.fresh(an_id(), t0()), "user_id", "42")
+    match sessmw.save(sessions, opts(), s, t0())
+        Err(_)  => test.assert(false)
+        Ok(out) =>
+            test.assert(out.stored)
+            test.assert(sessmw.has_cookie(out))
+            test.assert(str.starts_with(out.set_cookie, "__Host-"))
+
+@test
+fn test_a_sign_in_rotates_and_that_is_why_it_is_one_call() [io, mutate]
+    // `sess.rotate` plus the save, together, because the two halves
+    // separated are two halves somebody forgets one of — and
+    // forgetting this one is session fixation.
+    test.case("the record under the new identifier is written")
+    let sessions = sessstore.memory(100)
+    let s = sess.set(sess.fresh(an_id(), t0()), "user_id", "42")
+    match sessmw.sign_in(sessions, opts(), s, another_id(), t0())
+        Err(_)  => test.assert(false)
+        Ok(out) =>
+            test.assert(out.stored)
+            test.assert(out.dropped_previous)
+            test.assert(sessmw.has_cookie(out))
+
+    test.case("and the old one is gone from the store")
+    match sessions.sess_get(an_id())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_none(r)
+
+@test
+fn test_a_sign_out_deletes_the_record_and_expires_the_cookie() [io, mutate]
+    // `sess.clear` is not this: it empties the values and keeps the
+    // identifier, so an attacker who knew it still knows it.
+    test.case("the record goes")
+    let sessions = sessstore.memory(100)
+    let s = sess.set(sess.fresh(an_id(), t0()), "user_id", "42")
+    test.assert_none(sessions.sess_put(sess.to_record(s, sess.defaults(), t0())))
+    match sessmw.sign_out(sessions, opts(), s, t0())
+        Err(_)  => test.assert(false)
+        Ok(out) =>
+            test.assert(out.dropped_previous)
+            test.assert(str.contains(out.set_cookie, "Max-Age=0"))
+
+    test.case("and nothing is left behind")
+    match sessions.sess_get(an_id())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_none(r)
+
+@test
+fn test_a_sweep_is_the_callers_scheduler_and_never_a_request() [io, mutate]
+    // A sweep inside a request is a request that occasionally takes a
+    // second for a reason the person who made it cannot see.
+    test.case("an empty store")
+    let sessions = sessstore.memory(100)
+    match sessmw.sweep(sessions, t0())
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 0)
+
+@test
+fn test_the_header_name_is_published_so_nobody_spells_it() [io]
+    test.case("the one name")
+    test.assert_eq_str(sessmw.set_cookie_header(), "Set-Cookie")
+
+@test
+fn test_an_empty_outcome_has_no_cookie_to_attach() [io]
+    test.case("nothing to send")
+    let out = SessOutcome { set_cookie: "", stored: false, dropped_previous: false }
+    test.assert(not sessmw.has_cookie(out))
+
+    test.case("and something to send")
+    let out2 = SessOutcome { set_cookie: "__Host-sid=x; Path=/", stored: true,
+                             dropped_previous: false }
+    test.assert(sessmw.has_cookie(out2))
+
+@test
+fn test_the_faults_an_application_has_to_decide_about() [io]
+    test.case("a store that momentarily failed is worth retrying")
+    test.assert(sesserr.is_retryable(sesserr.SessStoreUnreadable("timeout")))
+    test.assert(not sesserr.is_retryable(sesserr.SessNoKey))
+
+    test.case("a missing key is a deployment nobody can restart out of")
+    test.assert(sesserr.is_configuration_fault(sesserr.SessNoKey))
+    test.assert(sesserr.is_configuration_fault(sesserr.SessPolicyImpossible("")))
+    test.assert(sesserr.is_configuration_fault(sesserr.SessUnsupported("sweep")))
+
+    test.case("a failed WRITE is a 500, because the person is not signed in")
+    test.assert(sesserr.status_for(sesserr.SessStoreUnwritable("disk full")) == 500)
+
+    test.case("and a store's detail string can name a path, so it stays in the log")
+    test.assert(not sesserr.is_client_safe(sesserr.SessStoreUnreadable("/var/lib/app")))
+
+@test
+fn test_a_cookie_too_large_carries_both_numbers() [io]
+    // "Too large" without them tells a deployment nothing it can act
+    // on.
+    test.case("the fault names the size and the ceiling")
+    let f = sesserr.SessCookieTooLarge(5000, 4096)
+    test.assert(str.len(f.message()) > 0)
+    test.assert(not sesserr.is_retryable(f))

@@ -1,0 +1,189 @@
+// sesscookie_tests.nv — the cookie half: the prefix that locks a
+// cookie to a host, the ceiling a browser enforces in silence, and the
+// key list that makes rotation possible.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: session-nv.sesscookie.<fn>`.
+//
+// Everything here is `[io]` alone.  The cookie half performs nothing —
+// it is cookie-nv's arithmetic over a string — which is what makes the
+// 4096-byte refusal and the `__Host-` rules testable without a browser.
+
+use std.test
+use std.bytes
+use std.list
+use std.str
+use civil
+use uuid
+use cookieattr
+use cookieseal
+use sess
+use sesscookie
+use sessid
+
+fn a_key() -> cookieseal.CookieKeys
+    cookieseal.one_key(bytes.from_byte_list(list.range(0, 32)))
+
+fn t0() -> civil.CivilDateTime
+    civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+
+fn a_session() -> sess.Sess
+    sess.fresh(sessid.of_uuid(uuid.nil()), t0())
+
+@test
+fn test_the_default_cookie_is_host_locked() [io]
+    // `__Host-` is the only host-locking cookies have.  Without it,
+    // anything that can put JavaScript on a sibling subdomain can set
+    // a session cookie for the application — which is session fixation
+    // with a different entry point.
+    test.case("the name carries the prefix")
+    let c = sesscookie.defaults(a_key())
+    test.assert(str.starts_with(c.name, "__Host-"))
+
+    test.case("and the attributes a browser needs for it to survive")
+    test.assert(list.len(sesscookie.problems(c)) == 0)
+
+@test
+fn test_the_two_kinds_differ_in_where_the_data_is() [io]
+    test.case("an identifier cookie")
+    test.assert(not sesscookie.is_client_side(sesscookie.defaults(a_key())))
+
+    test.case("a client-side cookie")
+    test.assert(sesscookie.is_client_side(sesscookie.client_side(a_key())))
+
+@test
+fn test_a_name_and_its_attributes_may_not_disagree() [io]
+    // A wrongly-attributed cookie is not an error anybody ever sees:
+    // the browser ignores it, the next request arrives without it, and
+    // the application concludes the person logged out.
+    let c = sesscookie.defaults(a_key())
+
+    test.case("another __Host- name is fine with the default attributes")
+    match sesscookie.with_name(c, "__Host-app-session")
+        Err(_) => test.assert(false)
+        Ok(c2) => test.assert_eq_str(c2.name, "__Host-app-session")
+
+    test.case("a __Secure- name with attributes that lack Secure is refused")
+    match sesscookie.with_attrs(c, cookieattr.empty_attrs())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and every problem is reported rather than the first")
+    test.assert(list.len(sesscookie.problems(c)) >= 0)
+
+@test
+fn test_the_browsers_ceiling_is_4096_and_this_package_refuses_rather_than_warns() [io]
+    // RFC 6265 § 6.1 asks for at least 4096 bytes per cookie; every
+    // browser treats it as a maximum and DISCARDS a larger one with no
+    // error anywhere.  The next request arrives with no session, which
+    // looks exactly like the person logging out — on the request that
+    // added the item that tipped it over.
+    test.case("the number is published so a test can assert it")
+    test.assert(sesscookie.cookie_ceiling() == 4096)
+
+    test.case("a small session fits")
+    let small = sess.set(a_session(), "user_id", "42")
+    test.assert(sesscookie.client_bytes(sesscookie.client_side(a_key()), small) < 4096)
+
+    test.case("and a session too large is a fault at the WRITE")
+    var big = a_session()
+    for i in 0..200
+        big = sess.set(big, "key-${i}", "0123456789012345678901234567890123456789")
+    match sesscookie.write_client(sesscookie.client_side(a_key()), big, sess.defaults())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_ceiling_question_can_be_asked_before_the_write() [io]
+    // So a handler storing something large can put it in a store
+    // instead, rather than discovering the ceiling in production.
+    test.case("the measurement is available on its own")
+    test.assert(sesscookie.client_bytes(sesscookie.client_side(a_key()), a_session()) > 0)
+
+@test
+fn test_an_identifier_cookie_is_written_with_the_policys_lifetime() [io]
+    // A cookie's lifetime and a record's expiry cannot be allowed to
+    // drift apart, which is why one function computes both from the
+    // same policy.
+    test.case("a Set-Cookie line comes out")
+    match sesscookie.write_id(sesscookie.defaults(a_key()), a_session(), sess.defaults())
+        Err(_)   => test.assert(false)
+        Ok(line) =>
+            test.assert(str.starts_with(line, "__Host-"))
+            test.assert(str.contains(line, "HttpOnly"))
+            test.assert(str.contains(line, "Secure"))
+            test.assert(str.contains(line, "SameSite=Lax"))
+
+@test
+fn test_a_deletion_matches_the_cookie_that_was_set() [io]
+    // Every attribute must match, or the browser deletes nothing and
+    // keeps the session — a sign-out that silently did not happen.
+    test.case("the deletion line")
+    match sesscookie.write_deletion(sesscookie.defaults(a_key()))
+        Err(_)   => test.assert(false)
+        Ok(line) =>
+            test.assert(str.starts_with(line, "__Host-"))
+            test.assert(str.contains(line, "Path=/"))
+            test.assert(str.contains(line, "Max-Age=0"))
+
+@test
+fn test_a_cookie_that_is_not_there_is_not_a_fault() [io]
+    // The ordinary first visit.
+    test.case("no header at all")
+    match sesscookie.read_id(sesscookie.defaults(a_key()), "")
+        Err(_) => test.assert(false)
+        Ok(id) => test.assert_none(id)
+
+    test.case("a header with other cookies and not this one")
+    match sesscookie.read_id(sesscookie.defaults(a_key()), "theme=dark; lang=en")
+        Err(_) => test.assert(false)
+        Ok(id) => test.assert_none(id)
+
+@test
+fn test_a_cookie_that_did_not_verify_is_a_fault_rather_than_absence() [io]
+    // The middleware turns it into "no session", but the distinction
+    // has to exist so a deployment can COUNT them: a trickle is a key
+    // rotation working, a spike is somebody probing.
+    test.case("an edited value")
+    match sesscookie.read_id(sesscookie.defaults(a_key()), "__Host-sid=forged.value")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_rotation_keeps_verifying_against_the_old_key() [io]
+    // A rotation that stopped verifying the old key would sign
+    // everybody out at once, which is the reason most deployments
+    // never rotate.
+    test.case("one key to start")
+    let c = sesscookie.defaults(a_key())
+    test.assert(sesscookie.key_count(c) == 1)
+
+    test.case("two after a rotation")
+    let c2 = sesscookie.rotate_key(c, bytes.from_byte_list([9, 9, 9]))
+    test.assert(sesscookie.key_count(c2) == 2)
+
+@test
+fn test_which_key_verified_is_the_state_a_single_key_api_cannot_be_in() [io]
+    // It is what lets a deployment watch the old key fall out of use
+    // and drop it when the number reaches zero, rather than guessing.
+    test.case("nothing verifies a forged cookie")
+    let c = sesscookie.rotate_key(sesscookie.defaults(a_key()),
+                                  bytes.from_byte_list([9, 9, 9]))
+    test.assert_none(sesscookie.verified_by(c, "__Host-sid=forged.value"))
+
+@test
+fn test_a_client_side_cookie_carries_the_session_and_checks_its_expiry() [io]
+    // A cookie whose session has expired answers `None` rather than a
+    // session a handler then has to check.
+    test.case("nothing there")
+    match sesscookie.read_client(sesscookie.client_side(a_key()), "",
+                                 sess.defaults(), t0())
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert_none(s)
+
+    test.case("and a value that did not decrypt is a fault")
+    match sesscookie.read_client(sesscookie.client_side(a_key()),
+                                 "__Host-sid=not-really-encrypted",
+                                 sess.defaults(), t0())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

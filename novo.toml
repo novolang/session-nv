@@ -1,0 +1,85 @@
+[package]
+name        = "session-nv"
+version     = "0.0.1"
+description = "Sessions for a web application: a store trait with an effect parameter, so a memory store costs [mutate] and a file store costs [fs] and the middleware costs whichever one you mounted.  Signed-cookie and store-backed sessions behind one interface, with rotation on privilege change.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and the effect rows inside it are the design.
+#
+# `sesserr`, `sess` and `sesscookie` are `[]` throughout: a session is
+# a value, its expiry is compared against a time the caller passes in,
+# and the cookie half is cookie-nv's arithmetic over a string.  That is
+# what makes rotation, flash-message consumption and the 4096-byte
+# cookie ceiling testable with no store and no clock in the room.
+#
+# `sessid` performs `[fs, rand]` when it MINTS an identifier and
+# nothing when it reads one.  The `[fs]` is the operating system's
+# generator, which is the device `/dev/urandom`; a session identifier
+# an attacker can predict is every session.
+#
+# `sessstore` is the interesting one.  `SessStore[e]` carries an EFFECT
+# PARAMETER, so the two stores shipped here cost what they actually
+# cost — `[mutate]` for the in-memory one, `[fs]` for the file one —
+# and `sessmw`'s functions bind that parameter and are charged whatever
+# the caller's store supplies.  A `web` application that mounts the
+# memory store in a test does not pay `[fs]` for it, and one that
+# mounts a database-backed store declares `[net]` because its store
+# does.  The row is the truth about the deployment rather than a
+# ceiling over every possible one.
+layer       = "host"
+
+category    = "web"
+
+tags        = ["session", "cookie", "middleware", "web", "tower-sessions", "flask-session", "authentication", "csrf"]
+repository  = "https://github.com/novolang/session-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "One interface over a cookie and a store, and the trait that lets the middleware cost what your store costs"
+
+[dependencies]
+# cookie-nv is the whole cookie half, and not a convenience.  It owns
+# the five attribute combinations a browser silently ignores —
+# `__Host-` with a `Domain`, `SameSite=None` without `Secure`, and
+# three more — and a session cookie is exactly the cookie where being
+# silently ignored looks like "the user keeps getting logged out".  Its
+# `cookieseal` is where the signing and the encryption live, with the
+# cookie NAME inside the MAC, which is what stops a signed session
+# cookie being moved into another cookie's slot.
+cookie-nv   = "^0.0.1"
+
+# calendar-nv is what an expiry is.  Idle timeout and absolute timeout
+# are two different questions about two different instants, and both
+# arrive as arguments rather than from a clock this package reads —
+# which is why every expiry rule here is a test and not a sleep.
+calendar-nv = "^0.0.2"
+
+# crypto-nv is one function: `digest.ct_eq`.  A session identifier is
+# compared against a value an attacker supplies, so the comparison is
+# constant-time or it is an oracle that leaks the identifier a byte at
+# a time.  It is the one comparison in this package that may not be
+# `==`.
+crypto-nv   = "^0.1.1"
+
+# uuid-nv is the default identifier: a version 4 from the operating
+# system's generator, 122 unpredictable bits, which is above what a
+# session identifier needs and what a reader can recognise in a log.
+uuid-nv     = "^0.1.4"
+
+# rand-nv is for the deployment that wants more than 122 bits.  A v4's
+# version and variant nibbles are FIXED, so its 122 bits are what it
+# has; `sessid.new_wide` is 256 bits of `rng.os_bytes` for a session
+# whose theft is worth somebody's time.  rand-nv is also where uuid-nv
+# gets its own bits, so this is not a second generator.
+rand-nv     = "^0.1.4"

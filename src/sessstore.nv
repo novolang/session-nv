@@ -1,0 +1,355 @@
+// sessstore.nv — where sessions live, behind one trait with an effect
+// parameter.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `SessStore[e]` IS THE LOAD-BEARING INTERFACE OF THIS PACKAGE, and
+// the `[e]` is the whole of the argument.
+//
+// A session store is the one part of a web application whose cost
+// genuinely differs by deployment.  An in-memory store mutates a cell:
+// `[mutate]`.  A file store reads and writes a directory: `[fs]`.  A
+// Redis or a Postgres store opens a socket: `[net]`.  Every one of
+// those is a legitimate session store and a program might use all three
+// — memory in a unit test, files on a single machine, a database
+// behind a load balancer.
+//
+// Without the effect parameter this package would have to pick.  It
+// could declare the union, `[fs, net, mutate]`, and then every
+// application that mounts the memory store in a test declares `[fs]`
+// and `[net]` for a store that touches neither — which makes the whole
+// effect row a ceiling rather than a description, and a ceiling tells a
+// reviewer nothing.  Or it could ship three unrelated interfaces and
+// make swapping stores a rewrite.
+//
+// With it, `sessmw.load<S: SessStore[e]>(sessions: S, …) [e]` is charged
+// what the caller's store supplies (SPEC § 5.6): `[mutate]`
+// against `SessMemory`, `[fs]` against `SessFiles`, `[net]` against a
+// store somebody else wrote.  A `web` application's declared row then
+// says what its session backend actually does, which is the sentence
+// the layer design exists to make true.
+//
+// FIVE METHODS, AND `sess_get` ANSWERS `?SessRecord` RATHER THAN A
+// RESULT FOR "NOT THERE".  An identifier that was never issued, one
+// that expired, and one that was deleted are ONE answer: `None`.
+// Telling them apart would make the store an oracle — an attacker with
+// a guessed identifier learns, one bit per guess, whether it was ever
+// real.  The `Result` is for a store that FAILED, which is a different
+// thing entirely.
+//
+// A STORE IS A HANDLE AND NOT THE DATA.  `SessMemory` holds a cell,
+// `SessFiles` holds a directory path; the methods take `self` by value
+// and the mutation happens behind the handle.  That is what lets a
+// store be a value a router holds and a request handler borrows,
+// rather than something threaded through every call.
+//
+// THE REDIS-SHAPED ADAPTER IS DECLARED AND NOT DEPENDED ON.
+// `SessRemote` below is the SHAPE a network-backed store takes — the
+// key prefix, the TTL, whether the server expires rows itself — as a
+// value this package can hold without depending on redis-nv.  A
+// deployment writes twenty lines implementing `SessStore[net]` over
+// its own client and mounts it.  Depending on redis-nv here would make
+// every application that uses a file store compile a Redis client.
+
+use civil
+use sesserr
+use sess
+use sessid
+
+// Where sessions live.
+//
+// The effect parameter is the point: an implementation declares what
+// it costs at the `impl`, and `sessmw`'s functions are charged that
+// rather than a union over every store anybody might write.
+pub trait SessStore[e]
+    // One record, or `None`.
+    //
+    // `None` covers three cases a caller must not be able to tell
+    // apart: never issued, expired, deleted.  A store that
+    // distinguished them would let an attacker probe the key space one
+    // bit at a time.
+    //
+    // The `Result` is for a store that failed — unreachable, a corrupt
+    // row — which is a different thing from a session that is not
+    // there.
+    fn sess_get(self, id: sessid.SessId) -> Result<?sess.SessRecord, sesserr.SessFault> [e]
+
+    // Write a record, replacing any under the same identifier.
+    //
+    // `None` on success.  A caller may not swallow the fault: a save
+    // that silently failed is a sign-in that appears to work and does
+    // not survive the redirect.
+    fn sess_put(self, r: sess.SessRecord) -> ?sesserr.SessFault [e]
+
+    // Delete a record.
+    //
+    // `None` on success, INCLUDING where there was nothing to delete —
+    // for the same reason `sess_get` answers `None`: a store that
+    // reported "no such row" would answer a question an attacker is
+    // asking.
+    fn sess_drop(self, id: sessid.SessId) -> ?sesserr.SessFault [e]
+
+    // Extend a record's expiry without rewriting its payload.
+    //
+    // The operation an idle timeout needs on every request, and the
+    // reason it is separate: on a store with a TTL — a cache, a
+    // database with an expiry column — this is one cheap command,
+    // where a read-modify-write would be three round trips per page
+    // view.  A store with no such operation implements it as a
+    // get-then-put and says nothing; the caller cannot tell.
+    fn sess_touch(self, id: sessid.SessId, expires_at: civil.CivilDateTime) -> ?sesserr.SessFault [e]
+
+    // Delete every record that expired before `now`, answering how
+    // many went.
+    //
+    // Called by a caller's own scheduler, never by the middleware: a
+    // sweep inside a request is a request that occasionally takes a
+    // second for no reason the person who made it can see.
+    //
+    // A store whose server expires rows itself answers zero and means
+    // it.  A store that cannot enumerate its keys answers
+    // `SessUnsupported`, which is the honest answer rather than a
+    // silent no-op that lets a directory grow to a million files.
+    fn sess_sweep(self, now: civil.CivilDateTime) -> Result<Int, sesserr.SessFault> [e]
+
+// ── The in-memory store ──────────────────────────────────────────────
+
+// Sessions in this process's memory.
+//
+// For a test, a single-process development server, and a program whose
+// sessions are genuinely allowed to end when it restarts.  `[mutate]`
+// and nothing else.
+pub struct SessMemory
+    // The handle the records live behind.
+    cell: Int
+
+// Records in memory, with a capacity.
+//
+// `[mutate]`, because allocating the table is a mutation.  The
+// capacity is a ceiling rather than a hint: a session store with no
+// ceiling is a memory-exhaustion surface that anybody with a socket
+// can reach, since every request without a cookie creates a session.
+// At the ceiling the OLDEST records go first.
+//
+// ```novo
+// use sessstore
+//
+// fn main() [io, mutate]
+//     let sessions = sessstore.memory(1000)
+//     println("${sessstore.memory_len(sessions)}")
+// ```
+pub fn memory(capacity: Int) -> SessMemory [mutate]
+    todo("session-nv.sessstore.memory")
+
+// How many records the store holds.
+//
+// ```novo
+// use sessstore
+//
+// fn main() [io, mutate]
+//     println("${sessstore.memory_len(sessstore.memory(10))}")
+// ```
+pub fn memory_len(s: SessMemory) -> Int [mutate]
+    todo("session-nv.sessstore.memory_len")
+
+// How many records were dropped because the store was full.
+//
+// Published because the alternative is a deployment discovering its
+// capacity is too small by reading complaints about people being
+// logged out.  A non-zero count here is a number to alert on.
+//
+// ```novo
+// use sessstore
+//
+// fn main() [io, mutate]
+//     println("${sessstore.memory_evicted(sessstore.memory(10))}")
+// ```
+pub fn memory_evicted(s: SessMemory) -> Int [mutate]
+    todo("session-nv.sessstore.memory_evicted")
+
+// The in-memory store's cost: `[mutate]`, and nothing else.
+//
+// A test that mounts this pays `[mutate]` for its session layer.  No
+// `[fs]`, no `[net]`, because it touches neither.
+//
+// ```novo
+// use sessstore
+//
+// fn main() [io, mutate]
+//     let sessions = sessstore.memory(10)
+//     println("${sessstore.memory_len(sessions)}")
+// ```
+impl SessStore[mutate] for SessMemory
+    fn sess_get(self, id: sessid.SessId) -> Result<?sess.SessRecord, sesserr.SessFault> [mutate]
+        todo("session-nv.sessstore.SessMemory.sess_get")
+
+    fn sess_put(self, r: sess.SessRecord) -> ?sesserr.SessFault [mutate]
+        todo("session-nv.sessstore.SessMemory.sess_put")
+
+    fn sess_drop(self, id: sessid.SessId) -> ?sesserr.SessFault [mutate]
+        todo("session-nv.sessstore.SessMemory.sess_drop")
+
+    fn sess_touch(self, id: sessid.SessId,
+                  expires_at: civil.CivilDateTime) -> ?sesserr.SessFault [mutate]
+        todo("session-nv.sessstore.SessMemory.sess_touch")
+
+    fn sess_sweep(self, now: civil.CivilDateTime) -> Result<Int, sesserr.SessFault> [mutate]
+        todo("session-nv.sessstore.SessMemory.sess_sweep")
+
+// ── The file store ───────────────────────────────────────────────────
+
+// Sessions as files under a directory.
+//
+// For a single machine that must survive a restart, and for a
+// deployment that has not earned a database yet.  `[fs]` and nothing
+// else.
+pub struct SessFiles
+    // The directory records live in.  One file per session, named for
+    // its identifier — which is why `sessid.parse` refuses anything
+    // outside its alphabet before a name is built from it.
+    root: Str
+
+// Records as files under `root`.
+//
+// The directory is not created and not checked here: this is a value,
+// and the first `sess_put` is where a missing directory becomes a
+// `SessStoreUnwritable` naming it.  That keeps the constructor `[]`
+// and a router's setup free of a filesystem round trip.
+//
+// ```novo
+// use sessstore
+//
+// fn main() [io]
+//     println(sessstore.files("/var/lib/app/sessions").root)
+// ```
+pub fn files(root: Str) -> SessFiles []
+    todo("session-nv.sessstore.files")
+
+// The path a record would be written to.
+//
+// Published so a deployment can assert the shape — and because the
+// rule is a security one worth reading: the file name is the
+// identifier and NOTHING ELSE, the identifier has already been through
+// `sessid.parse`, and the result is joined to `root` without any path
+// arithmetic that `..` could reach through.
+//
+// ```novo
+// use sessstore
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) => println(sessstore.file_path(sessstore.files("/tmp/s"), id))
+// ```
+pub fn file_path(s: SessFiles, id: sessid.SessId) -> Str []
+    todo("session-nv.sessstore.file_path")
+
+// The file store's cost: `[fs]`, and nothing else.
+//
+// A deployment that mounts this pays `[fs]` for its session layer and
+// no `[net]`.
+//
+// ```novo
+// use sessstore
+//
+// fn main() [io]
+//     println(sessstore.files("/var/lib/app/sessions").root)
+// ```
+impl SessStore[fs] for SessFiles
+    fn sess_get(self, id: sessid.SessId) -> Result<?sess.SessRecord, sesserr.SessFault> [fs]
+        todo("session-nv.sessstore.SessFiles.sess_get")
+
+    fn sess_put(self, r: sess.SessRecord) -> ?sesserr.SessFault [fs]
+        todo("session-nv.sessstore.SessFiles.sess_put")
+
+    fn sess_drop(self, id: sessid.SessId) -> ?sesserr.SessFault [fs]
+        todo("session-nv.sessstore.SessFiles.sess_drop")
+
+    fn sess_touch(self, id: sessid.SessId,
+                  expires_at: civil.CivilDateTime) -> ?sesserr.SessFault [fs]
+        todo("session-nv.sessstore.SessFiles.sess_touch")
+
+    fn sess_sweep(self, now: civil.CivilDateTime) -> Result<Int, sesserr.SessFault> [fs]
+        todo("session-nv.sessstore.SessFiles.sess_sweep")
+
+// ── The shape a network store takes ──────────────────────────────────
+
+// The configuration a Redis-shaped store needs, as a value this
+// package can hold without depending on one.
+//
+// DECLARED AND NOT DEPENDED ON, on purpose.  A deployment writes
+// twenty lines implementing `SessStore[net]` over its own client and
+// mounts it; the `[net]` lands on the `impl`, `sessmw` is charged it
+// through `[e]`, and nothing in this package changes.  Depending on
+// redis-nv here would make every application that uses a file store
+// compile a Redis client it never calls.
+pub struct SessRemote
+    // What every key is prefixed with, so sessions share a database
+    // with other things without colliding.  `session:` by convention.
+    key_prefix: Str
+    // Whether the server expires rows itself.  `true` for Redis, whose
+    // `EXPIRE` is exactly this, and for a database with a TTL column;
+    // when it is true, `sess_sweep` answers zero and means it, and a
+    // caller does not schedule one.
+    server_expires: Bool
+    // Whether `sess_touch` is one command on this server.  Redis's
+    // `EXPIRE` is; a table without a TTL column is not, and the store
+    // does a read-modify-write instead.
+    cheap_touch: Bool
+
+// The conventional remote shape: `session:` prefixed, server-expiring,
+// cheap to touch.
+//
+// ```novo
+// use sessstore
+//
+// fn main() [io]
+//     println(sessstore.remote_defaults().key_prefix)
+// ```
+pub fn remote_defaults() -> SessRemote []
+    todo("session-nv.sessstore.remote_defaults")
+
+// The key a record has on a remote sessions.
+//
+// The prefix and the identifier, and nothing else.  Published so a
+// person can find a session in a database by hand — which is what
+// somebody debugging a production incident at midnight actually needs.
+//
+// ```novo
+// use sessstore
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) => println(sessstore.remote_key(sessstore.remote_defaults(), id))
+// ```
+pub fn remote_key(r: SessRemote, id: sessid.SessId) -> Str []
+    todo("session-nv.sessstore.remote_key")
+
+// The seconds a record should live on a remote sessions, given a policy
+// and a session.
+//
+// What goes into a server-side `EXPIRE` or a TTL column.  Zero where
+// the policy has no expiry at all, which a remote store should read as
+// "no TTL" rather than "expire immediately" — the two are one
+// character apart in most clients and the second one logs everybody
+// out.
+//
+// ```novo
+// use civil
+// use sess
+// use sessstore
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn main() [io]
+//     let s = sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//     println("${sessstore.remote_ttl(sess.defaults(), s, a_moment())}")
+// ```
+pub fn remote_ttl(p: sess.SessPolicy, s: sess.Sess, now: civil.CivilDateTime) -> Int []
+    todo("session-nv.sessstore.remote_ttl")

@@ -1,0 +1,430 @@
+// sessmw.nv — the two halves a `web` application mounts: load before
+// the handler, save after it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY FUNCTION HERE IS EFFECT-POLYMORPHIC, and that is what makes
+// the package usable.  `load<S: SessStore[e]>(sessions: S, …) [e]` is
+// charged what the caller's store supplies: `[mutate]` against
+// `SessMemory`, `[fs]` against `SessFiles`, `[net]` against a store
+// somebody wrote over a database client.  An application's declared
+// effect row then describes its actual session backend rather than a
+// union over every backend this package can imagine.
+//
+// WHY THIS IS TWO FUNCTIONS AND NOT ONE WRAPPER.  The obvious shape is
+// a middleware that takes a handler and returns a handler — which is
+// what the standard library's `http.server.wrap` does, and what
+// `mw_access_log` is.  It does not work here, for a reason worth
+// stating: a session middleware has to give the HANDLER the session,
+// and take it back afterwards, and a `fn(HttpRequest) -> HttpResponse`
+// has nowhere to put one.
+//
+// Three shapes were considered.  Threading the session through a
+// request field would mean editing the standard library's
+// `HttpRequest`.  Holding it in a cell keyed by a request identifier
+// would mean the session layer owns a piece of mutable global state
+// with a lifetime nobody can see.  Two functions and an explicit value
+// means the handler's signature says it takes a session — which is
+// also the only one of the three a reader can follow.
+//
+// So an application's handler is `fn(HttpRequest, Sess) -> (HttpResponse, Sess)`
+// and its route wrapper is four lines: `load`, call the handler,
+// `save`, attach the cookie to the response.  The README shows those
+// four lines; this package does not wrap them, because a wrapper that
+// hid the session would have nowhere to hand it over.
+//
+// THE SAVE IS CONDITIONAL, AND THAT IS THE PERFORMANCE STORY.  `save`
+// writes only when `sess.needs_save` says to, which is false for the
+// overwhelming majority of requests — the ones that read a session and
+// change nothing.  A middleware that wrote unconditionally would put a
+// store write on every page view.
+//
+// THE ORDER OF THE THREE WRITES MATTERS, and `save` does them in it:
+// write the new record FIRST, then delete the superseded one, then
+// emit the cookie.  A rotation that deleted first has a window in which
+// neither record exists — and a request arriving in that window from
+// the same browser finds nothing and is signed out.
+
+use civil
+use sess
+use sesscookie
+use sesserr
+use sessid
+use sessstore
+
+// What a request's session layer resolved to.
+//
+// Not a `?Sess`, because the three cases have different answers: a
+// returning visitor whose session is live, a returning visitor whose
+// session has ended, and a first visit.  A middleware that collapsed
+// the middle two cannot tell a person "your session timed out" from
+// "hello".
+pub enum SessLoaded
+    // A live session from the store or the cookie.
+    SessFound(session: sess.Sess)
+    // A cookie was there, and the session behind it has ended — the
+    // idle timeout, the absolute one, or a record that is gone.  The
+    // fresh session is supplied so the request can carry on, and the
+    // reason is there so the page can say what happened.
+    SessExpired(session: sess.Sess, reason: Str)
+    // No cookie, or one that did not verify.  A fresh session.
+    SessNew(session: sess.Sess)
+
+// Everything a session layer needs to answer a request.
+pub struct SessOptions
+    // The cookie's name, kind, attributes and keys.
+    cookie: sesscookie.SessCookie
+    // The two timeouts and the cookie ceiling.
+    policy: sess.SessPolicy
+    // Whether a request with no session gets one anyway.
+    //
+    // FALSE by default, and the default is the interesting half: a
+    // public page that creates a session for every visitor creates one
+    // for every crawler too, and a deployment discovers this as a
+    // store that grows by a million rows a week with nothing in them.
+    // A session is created when a handler first WRITES to it.
+    create_eagerly: Bool
+
+// The conventional options.
+//
+// ```novo
+// use cookieseal
+// use sessmw
+// use sesscookie
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     println("${sessmw.options(sesscookie.defaults(k)).create_eagerly}")
+// ```
+pub fn options(cookie: sesscookie.SessCookie) -> SessOptions []
+    todo("session-nv.sessmw.options")
+
+// The same options under a policy the caller chose.
+//
+// Refuses a policy that cannot work — `sess.check_policy` — at the
+// moment it is configured rather than in production.
+//
+// ```novo
+// use cookieseal
+// use sess
+// use sesscookie
+// use sessmw
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     match sessmw.with_policy(sessmw.options(sesscookie.defaults(k)),
+//                              sess.policy(1800, 43200))
+//         Ok(_)  => println("accepted")
+//         Err(_) => println("that policy cannot work")
+// ```
+pub fn with_policy(o: SessOptions, p: sess.SessPolicy) -> Result<SessOptions, sesserr.SessFault> []
+    todo("session-nv.sessmw.with_policy")
+
+// The same options, creating a session for every request.
+//
+// For the application where every visitor genuinely needs one — a
+// shopping basket that has to survive a browse.  Say it out loud
+// rather than getting it by accident: the cost is a store row per
+// crawler.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use sessmw
+// use std.bytes
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let o = sessmw.eager(sessmw.options(sesscookie.defaults(k)))
+//     println("${o.create_eagerly}")
+// ```
+pub fn eager(o: SessOptions) -> SessOptions []
+    todo("session-nv.sessmw.eager")
+
+// ── Before the handler ───────────────────────────────────────────────
+
+// The session for a request.
+//
+// `[e]` — this costs what the caller's store costs, and nothing more.
+// A test mounting `SessMemory` pays `[mutate]`; a single-machine
+// deployment mounting `SessFiles` pays `[fs]`; a deployment with a
+// database-backed store pays whatever that store declared.
+//
+// `new_id` is the identifier to use if a fresh session is needed, and
+// it is a PARAMETER because minting one costs `[fs, rand]` and this
+// function should not be charged that on the requests where no session
+// is created — which is most of them.  A caller mints one per request
+// with `sessid.new`, or mints lazily and passes the same value.
+//
+// A cookie that did not verify is `SessNew` rather than a fault: a
+// deployment that rotated its signing key would otherwise answer an
+// error to every returning visitor at once.  The fault is still
+// reported through `load_faults` so an operator can tell a rotation
+// from an attack by the shape of the graph.
+//
+// ```novo
+// use cookieseal
+// use sess
+// use sesscookie
+// use sessid
+// use sessmw
+// use sessstore
+// use civil
+// use uuid
+// use std.bytes
+//
+// fn main() [io, mutate]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let o = sessmw.options(sesscookie.defaults(k))
+//     let sessions = sessstore.memory(100)
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     match sessmw.load(sessions, o, "", sessid.of_uuid(uuid.nil()), at)
+//         Err(_) => println("the store failed")
+//         Ok(l)  =>
+//             match l
+//                 SessFound(s)      => println("returning")
+//                 SessExpired(s, r) => println("timed out: ${r}")
+//                 SessNew(s)        => println("first visit")
+// ```
+pub fn load<S: SessStore[e]>(sessions: S, o: SessOptions, cookie_header: Str, new_id: sessid.SessId,
+                             now: civil.CivilDateTime) -> Result<SessLoaded, sesserr.SessFault> [e]
+    todo("session-nv.sessmw.load")
+
+// The session a `SessLoaded` carries, whichever kind it is.
+//
+// For the handler that does not care why it got one.
+//
+// ```novo
+// use sess
+// use sessid
+// use sessmw
+// use civil
+// use uuid
+//
+// fn main() [io]
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     let s = sess.fresh(sessid.of_uuid(uuid.nil()), at)
+//     println("${sess.len(sessmw.session_of(sessmw.SessNew(s)))}")
+// ```
+pub fn session_of(l: SessLoaded) -> sess.Sess []
+    todo("session-nv.sessmw.session_of")
+
+// Why a previous session ended, or empty.
+//
+// `idle` or `absolute`, which is what a page saying "you were signed
+// out because…" needs.  The two have different fixes and one message
+// for both tells a person nothing.
+//
+// ```novo
+// use sess
+// use sessid
+// use sessmw
+// use civil
+// use uuid
+//
+// fn main() [io]
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     let s = sess.fresh(sessid.of_uuid(uuid.nil()), at)
+//     println(sessmw.expiry_reason_of(sessmw.SessNew(s)))
+// ```
+pub fn expiry_reason_of(l: SessLoaded) -> Str []
+    todo("session-nv.sessmw.expiry_reason_of")
+
+// The cookie faults a load swallowed, so they can be counted.
+//
+// A cookie that did not verify does not fail a request — it means "no
+// session" — but a deployment still wants the number.  A steady
+// trickle is a key rotation working; a spike is somebody probing.
+//
+// ```novo
+// use cookieseal
+// use sesscookie
+// use sessmw
+// use std.bytes
+// use std.list
+//
+// fn main() [io]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let o = sessmw.options(sesscookie.defaults(k))
+//     println("${list.len(sessmw.load_faults(o, "__Host-sid=nonsense"))}")
+// ```
+pub fn load_faults(o: SessOptions, cookie_header: Str) -> [sesserr.SessFault] []
+    todo("session-nv.sessmw.load_faults")
+
+// ── After the handler ────────────────────────────────────────────────
+
+// What a response has to carry after a session was handled.
+pub struct SessOutcome
+    // The `Set-Cookie` line, empty where none is needed.  A cookie
+    // re-sent on every request is bytes on every response and a header
+    // that defeats a shared cache.
+    set_cookie: Str
+    // Whether anything reached the sessions.
+    stored: Bool
+    // Whether a superseded record was deleted.
+    dropped_previous: Bool
+
+// Persist a session, and say what the response must carry.
+//
+// `[e]` — again, what the caller's store costs.
+//
+// **In this order, and the order is the point**: write the new record,
+// then delete the superseded one, then build the cookie.  A rotation
+// that deleted first leaves a window in which neither record exists,
+// and a request arriving in that window from the same browser finds
+// nothing and is signed out — which is a race that reproduces once a
+// week on a busy deployment and never in a test.
+//
+// Writes nothing at all where `sess.needs_save` is false, which is the
+// overwhelming majority of requests.
+//
+// ```novo
+// use cookieseal
+// use sess
+// use sesscookie
+// use sessid
+// use sessmw
+// use sessstore
+// use civil
+// use uuid
+// use std.bytes
+//
+// fn main() [io, mutate]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let o = sessmw.options(sesscookie.defaults(k))
+//     let sessions = sessstore.memory(100)
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     let s = sess.set(sess.fresh(sessid.of_uuid(uuid.nil()), at), "user", "1")
+//     match sessmw.save(sessions, o, s, at)
+//         Ok(out) => println(out.set_cookie)
+//         Err(_)  => println("the session was not saved")
+// ```
+pub fn save<S: SessStore[e]>(sessions: S, o: SessOptions, s: sess.Sess,
+                             now: civil.CivilDateTime) -> Result<SessOutcome, sesserr.SessFault> [e]
+    todo("session-nv.sessmw.save")
+
+// A session with the identifier rotated, saved, and the old record
+// gone.
+//
+// **Call this at every sign-in**, and at every other privilege change:
+// a step up to an administrative role, the acceptance of an
+// invitation, a switch between accounts.  It is `sess.rotate` plus the
+// save, in one call, because the two halves separated are two halves
+// somebody forgets one of — and forgetting this one is session
+// fixation, where an attacker who planted a known identifier in
+// somebody's browser before they signed in holds an authenticated
+// session after they did.
+//
+// The new identifier is a parameter for the same reason it is on
+// `load`: minting costs `[fs, rand]` and this function should not be
+// charged it.
+//
+// ```novo
+// use cookieseal
+// use sess
+// use sesscookie
+// use sessid
+// use sessmw
+// use sessstore
+// use civil
+// use uuid
+// use std.bytes
+//
+// fn main() [io, mutate]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let o = sessmw.options(sesscookie.defaults(k))
+//     let sessions = sessstore.memory(100)
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     let s = sess.fresh(sessid.of_uuid(uuid.nil()), at)
+//     match sessmw.sign_in(sessions, o, s, sessid.of_uuid(uuid.max()), at)
+//         Ok(_)  => println("rotated and stored")
+//         Err(_) => println("the sign-in was not stored")
+// ```
+pub fn sign_in<S: SessStore[e]>(sessions: S, o: SessOptions, s: sess.Sess, new_id: sessid.SessId,
+                                now: civil.CivilDateTime) -> Result<SessOutcome, sesserr.SessFault> [e]
+    todo("session-nv.sessmw.sign_in")
+
+// The session destroyed, the record deleted, and a cookie that
+// expires.
+//
+// A sign-out.  `sess.clear` is NOT this: it empties the values and
+// keeps the identifier, so an attacker who knew the identifier still
+// knows it.
+//
+// ```novo
+// use cookieseal
+// use sess
+// use sesscookie
+// use sessid
+// use sessmw
+// use sessstore
+// use civil
+// use uuid
+// use std.bytes
+//
+// fn main() [io, mutate]
+//     let k = cookieseal.one_key(bytes.from_byte_list([1, 2, 3]))
+//     let o = sessmw.options(sesscookie.defaults(k))
+//     let sessions = sessstore.memory(100)
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     let s = sess.fresh(sessid.of_uuid(uuid.nil()), at)
+//     match sessmw.sign_out(sessions, o, s, at)
+//         Ok(out) => println(out.set_cookie)
+//         Err(_)  => println("the sign-out did not reach the store")
+// ```
+pub fn sign_out<S: SessStore[e]>(sessions: S, o: SessOptions, s: sess.Sess,
+                                 now: civil.CivilDateTime) -> Result<SessOutcome, sesserr.SessFault> [e]
+    todo("session-nv.sessmw.sign_out")
+
+// ── Housekeeping ─────────────────────────────────────────────────────
+
+// Delete every expired record, answering how many went.
+//
+// For a caller's own scheduler — an hourly task, a cron — and NEVER
+// from inside a request: a sweep in a request handler is a request
+// that occasionally takes a second for a reason the person who made it
+// cannot see.  A store whose server expires rows itself answers zero
+// and means it.
+//
+// ```novo
+// use sessmw
+// use sessstore
+// use civil
+//
+// fn main() [io, mutate]
+//     let sessions = sessstore.memory(100)
+//     let at = civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//     match sessmw.sweep(sessions, at)
+//         Ok(n)  => println("${n}")
+//         Err(_) => println("this store cannot sweep")
+// ```
+pub fn sweep<S: SessStore[e]>(sessions: S,
+                              now: civil.CivilDateTime) -> Result<Int, sesserr.SessFault> [e]
+    todo("session-nv.sessmw.sweep")
+
+// The `Set-Cookie` header name, so a caller attaching an outcome does
+// not spell it.
+//
+// ```novo
+// use sessmw
+//
+// fn main() [io]
+//     println(sessmw.set_cookie_header())
+// ```
+pub fn set_cookie_header() -> Str []
+    todo("session-nv.sessmw.set_cookie_header")
+
+// Whether an outcome has a cookie to attach.
+//
+// ```novo
+// use sessmw
+//
+// fn main() [io]
+//     let out = SessOutcome { set_cookie: "", stored: false,
+//                             dropped_previous: false }
+//     println("${sessmw.has_cookie(out)}")
+// ```
+pub fn has_cookie(o: SessOutcome) -> Bool []
+    todo("session-nv.sessmw.has_cookie")

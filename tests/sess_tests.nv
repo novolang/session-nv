@@ -1,0 +1,315 @@
+// sess_tests.nv — the session value: change tracking, the two
+// timeouts, rotation, and flash messages.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: session-nv.sess.<fn>`.
+//
+// NOTHING HERE READS A CLOCK OR TOUCHES A STORE.  Every time is a
+// literal and every session is built from public constructors, which
+// is the whole point of keeping the value half `[]`: "does rotation
+// carry the data across?" and "does a read mark the session dirty?"
+// are questions a test answers in a millisecond with nothing
+// installed.
+
+use std.test
+use std.list
+use arith
+use civil
+use span
+use uuid
+use sess
+use sessid
+
+// Midnight on 12 September 2026, as an epoch day so nothing here has
+// to unwrap a `Result`.
+fn t0() -> civil.CivilDateTime
+    civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+
+// `secs` seconds after `t0`.
+fn at(secs: Int) -> civil.CivilDateTime
+    match arith.add_delta(t0(), span.seconds(secs))
+        Ok(dt) => dt
+        Err(_) => t0()
+
+fn an_id() -> sessid.SessId
+    sessid.of_uuid(uuid.nil())
+
+fn another_id() -> sessid.SessId
+    sessid.of_uuid(uuid.max())
+
+fn a_session() -> sess.Sess
+    sess.fresh(an_id(), t0())
+
+@test
+fn test_a_fresh_session_is_empty_and_knows_it_is_new() [io]
+    test.case("nothing in it")
+    let s = a_session()
+    test.assert(sess.len(s) == 0)
+    test.assert(sess.flash_count(s) == 0)
+
+    test.case("and the change state says store it and send a cookie")
+    test.assert(sess.is_fresh(s))
+    test.assert(sess.needs_cookie(s))
+    test.assert(sess.needs_save(s, sess.defaults()))
+
+@test
+fn test_reading_a_session_does_not_make_it_dirty() [io]
+    // The performance story of the whole package: a middleware that
+    // wrote after every request would write after the requests that
+    // only read, which is nearly all of them.
+    test.case("a get changes nothing")
+    let s = sess.of_record(sess.to_record(a_session(), sess.defaults(), t0()))
+    match s
+        Err(_)     => test.assert(false)
+        Ok(loaded) =>
+            let _ = sess.get(loaded, "user_id")
+            let _ = sess.has(loaded, "user_id")
+            let _ = sess.keys(loaded)
+            test.assert(not sess.is_dirty(loaded))
+            test.assert(not sess.needs_save(loaded, sess.defaults()))
+
+@test
+fn test_writing_the_same_value_twice_is_not_a_second_write() [io]
+    // A handler that sets `theme` on every request would otherwise put
+    // a store write on every page view.
+    test.case("a set that changes something")
+    let s = sess.set(a_session(), "theme", "dark")
+    test.assert_eq_str(sess.get_or(s, "theme", "light"), "dark")
+
+    test.case("a set of the value already there does not dirty a loaded session")
+    match sess.of_record(sess.to_record(s, sess.defaults(), t0()))
+        Err(_)     => test.assert(false)
+        Ok(loaded) =>
+            test.assert(not sess.is_dirty(sess.set(loaded, "theme", "dark")))
+            test.assert(sess.is_dirty(sess.set(loaded, "theme", "light")))
+
+@test
+fn test_removing_a_key_that_was_not_there_changes_nothing() [io]
+    test.case("a loaded session, a key that is absent")
+    match sess.of_record(sess.to_record(a_session(), sess.defaults(), t0()))
+        Err(_)     => test.assert(false)
+        Ok(loaded) =>
+            test.assert(not sess.is_dirty(sess.remove(loaded, "nothing")))
+
+@test
+fn test_clear_keeps_the_identifier_and_that_is_why_it_is_not_a_sign_out() [io]
+    // An attacker who knew the identifier still knows it.  `destroy`
+    // and `rotate` are the two that change it.
+    test.case("the values go")
+    let s = sess.set(sess.set(a_session(), "a", "1"), "b", "2")
+    test.assert(sess.len(sess.clear(s)) == 0)
+
+    test.case("and the identifier stays")
+    test.assert(sessid.id_eq(sess.clear(s).id, an_id()))
+
+    test.case("which is the difference from a destruction")
+    test.assert(not sess.was_destroyed(sess.clear(s)))
+    test.assert(sess.was_destroyed(sess.destroy(s)))
+
+@test
+fn test_rotation_carries_the_data_under_a_new_identifier() [io]
+    // Session fixation: an attacker plants a known identifier in a
+    // browser BEFORE the sign-in, and holds the authenticated session
+    // after it.  Rotation is the fix, and it is the fix every
+    // framework makes optional.
+    test.case("the data survives")
+    let s = sess.set(a_session(), "user_id", "42")
+    let r = sess.rotate(s, another_id())
+    test.assert_eq_str(sess.get_or(r, "user_id", ""), "42")
+
+    test.case("the identifier does not")
+    test.assert(not sessid.id_eq(r.id, an_id()))
+    test.assert(sessid.id_eq(r.id, another_id()))
+
+    test.case("and the OLD one is carried, so the old record can be deleted")
+    match sess.superseded(r)
+        None      => test.assert(false)
+        Some(old) => test.assert(sessid.id_eq(old, an_id()))
+
+@test
+fn test_a_rotation_that_left_the_old_record_would_keep_the_fixed_session() [io]
+    test.case("rotation says a cookie is needed")
+    let r = sess.rotate(a_session(), another_id())
+    test.assert(sess.was_rotated(r))
+    test.assert(sess.needs_cookie(r))
+    test.assert(sess.needs_save(r, sess.defaults()))
+
+    test.case("and a destruction says the same about its own old identifier")
+    match sess.superseded(sess.destroy(a_session()))
+        None      => test.assert(false)
+        Some(old) => test.assert(sessid.id_eq(old, an_id()))
+
+@test
+fn test_the_two_timeouts_answer_different_questions() [io]
+    // A deployment with only the idle timeout has sessions a stolen
+    // cookie in an automated loop keeps alive forever — which is
+    // exactly the session an attacker has.
+    let p = sess.policy(1800, 43200)
+
+    test.case("idle: untouched for longer than the idle timeout")
+    let s = a_session()
+    test.assert(not sess.is_expired(s, p, at(1799)))
+    test.assert(sess.is_expired(s, p, at(1801)))
+    test.assert_eq_str(sess.expiry_reason(s, p, at(1801)), "idle")
+
+    test.case("absolute: touched constantly, and still over")
+    let busy = sess.touch(s, at(43100))
+    test.assert(not sess.is_expired(busy, p, at(43100)))
+    test.assert(sess.is_expired(busy, p, at(43300)))
+    test.assert_eq_str(sess.expiry_reason(busy, p, at(43300)), "absolute")
+
+    test.case("and a live session has no reason")
+    test.assert_eq_str(sess.expiry_reason(s, p, at(10)), "")
+
+@test
+fn test_a_zero_timeout_is_no_timeout_rather_than_an_instant_one() [io]
+    test.case("no idle timeout")
+    let s = a_session()
+    test.assert(not sess.is_expired(s, sess.policy(0, 43200), at(100000)))
+
+    test.case("no absolute timeout, touched")
+    let busy = sess.touch(s, at(1000000))
+    test.assert(not sess.is_expired(busy, sess.policy(1800, 0), at(1000001)))
+
+@test
+fn test_a_policy_whose_absolute_life_is_shorter_than_its_idle_wait_is_refused() [io]
+    // A session that expires before it can ever be refreshed logs
+    // everybody out mid-task.  Caught where the policy is written.
+    test.case("an hour of idle inside ten minutes of life")
+    test.assert_some(sess.check_policy(sess.policy(3600, 600)))
+
+    test.case("the ordinary way round is fine")
+    test.assert_none(sess.check_policy(sess.policy(1800, 43200)))
+
+    test.case("and so are the defaults")
+    test.assert_none(sess.check_policy(sess.defaults()))
+
+@test
+fn test_the_defaults_are_the_numbers_they_claim_to_be() [io]
+    test.case("thirty minutes idle, twelve hours absolute")
+    let d = sess.defaults()
+    test.assert(d.idle_secs == 1800)
+    test.assert(d.absolute_secs == 43200)
+
+    test.case("and RFC 6265 § 6.1's per-cookie floor as the ceiling")
+    test.assert(d.cookie_ceiling == 4096)
+
+    test.case("an unchanged session is not written back")
+    test.assert(not d.save_unchanged)
+
+@test
+fn test_the_expiry_is_the_earlier_of_the_two() [io]
+    test.case("idle wins on a session that was just created")
+    let e = sess.expires_at(a_session(), sess.policy(1800, 43200))
+    test.assert(civil.compare_datetime(e, at(1800)) == 0)
+
+@test
+fn test_touch_refreshes_the_idle_clock_without_dirtying_the_session() [io]
+    // A touch on every request is exactly the write the change state
+    // exists to avoid.
+    test.case("the idle clock moves")
+    let p = sess.policy(1800, 43200)
+    let s = a_session()
+    test.assert(sess.is_expired(s, p, at(2000)))
+    test.assert(not sess.is_expired(sess.touch(s, at(1500)), p, at(2000)))
+
+    test.case("and nothing is marked dirty by it")
+    match sess.of_record(sess.to_record(s, p, t0()))
+        Err(_)     => test.assert(false)
+        Ok(loaded) => test.assert(not sess.is_dirty(sess.touch(loaded, at(100))))
+
+@test
+fn test_save_unchanged_is_how_a_deployment_asks_for_the_write_anyway() [io]
+    test.case("a loaded, untouched session is not saved by default")
+    match sess.of_record(sess.to_record(a_session(), sess.defaults(), t0()))
+        Err(_)     => test.assert(false)
+        Ok(loaded) =>
+            test.assert(not sess.needs_save(loaded, sess.defaults()))
+
+            test.case("and is, where the policy says so out loud")
+            let p = SessPolicy { idle_secs: 1800, absolute_secs: 43200,
+                                 cookie_ceiling: 4096, save_unchanged: true }
+            test.assert(sess.needs_save(loaded, p))
+
+@test
+fn test_a_flash_is_consumed_by_reading_and_peeking_does_not() [io]
+    // "Saved." shown twice, on a page the person did not save anything
+    // from, is what a reader that did not remove the message produces.
+    test.case("one message goes in")
+    let s = sess.flash(a_session(), "info", "Saved.")
+    test.assert(sess.flash_count(s) == 1)
+
+    test.case("peeking leaves it")
+    test.assert(list.len(sess.peek_flash(s, "info")) == 1)
+    test.assert(sess.flash_count(s) == 1)
+
+    test.case("taking removes it")
+    let (s2, msgs) = sess.take_flash(s, "info")
+    test.assert(list.len(msgs) == 1)
+    test.assert(sess.flash_count(s2) == 0)
+
+    test.case("and taking again finds nothing")
+    let (_, again) = sess.take_flash(s2, "info")
+    test.assert(list.len(again) == 0)
+
+@test
+fn test_several_messages_share_a_severity_and_all_of_them_come_back() [io]
+    test.case("two under one key")
+    let s = sess.flash(sess.flash(a_session(), "error", "Too short."),
+                       "error", "Already taken.")
+    test.assert(sess.flash_count(s) == 2)
+
+    test.case("both come back at once")
+    let (_, msgs) = sess.take_flash(s, "error")
+    test.assert(list.len(msgs) == 2)
+
+    test.case("and a layout takes every severity in one call")
+    let mixed = sess.flash(s, "info", "Welcome back.")
+    let (after, all) = sess.take_all_flashes(mixed)
+    test.assert(list.len(all) == 3)
+    test.assert(sess.flash_count(after) == 0)
+
+@test
+fn test_consuming_a_flash_dirties_the_session_because_the_store_must_forget_it() [io]
+    // The one read that IS a write: a flash that was shown and not
+    // removed from the store is shown again on the next page.
+    test.case("a take marks it dirty")
+    match sess.of_record(sess.to_record(sess.flash(a_session(), "info", "Saved."),
+                                        sess.defaults(), t0()))
+        Err(_)     => test.assert(false)
+        Ok(loaded) =>
+            let (after, _) = sess.take_flash(loaded, "info")
+            test.assert(sess.is_dirty(after))
+
+    test.case("a peek does not")
+    match sess.of_record(sess.to_record(sess.flash(a_session(), "info", "Saved."),
+                                        sess.defaults(), t0()))
+        Err(_)     => test.assert(false)
+        Ok(loaded) =>
+            let _ = sess.peek_flash(loaded, "info")
+            test.assert(not sess.is_dirty(loaded))
+
+@test
+fn test_a_record_round_trips_and_an_unreadable_one_is_refused() [io]
+    test.case("the values survive")
+    let s = sess.set(sess.flash(a_session(), "info", "Hi"), "user_id", "42")
+    match sess.of_record(sess.to_record(s, sess.defaults(), t0()))
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.assert_eq_str(sess.get_or(back, "user_id", ""), "42")
+            test.assert(sess.flash_count(back) == 1)
+
+    test.case("a payload from nowhere is refused rather than half-read")
+    let bad = SessRecord { id: an_id(), payload: "<html>", expires_at: t0() }
+    match sess.of_record(bad)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_record_carries_the_expiry_so_a_store_with_a_ttl_can_use_it() [io]
+    test.case("the earlier of the two timeouts")
+    let r = sess.to_record(a_session(), sess.policy(1800, 43200), t0())
+    test.assert(civil.compare_datetime(r.expires_at, at(1800)) == 0)
+
+    test.case("and the identifier is the key")
+    test.assert(sessid.id_eq(r.id, an_id()))

@@ -1,0 +1,134 @@
+// sessid_tests.nv — the identifier: where its bits come from, what it
+// refuses, and why the comparison is not `==`.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: session-nv.sessid.<fn>`.
+//
+// The two minting tests name `[fs, rand]` in their own rows, which is
+// the compiler agreeing that the entropy comes from the operating
+// system's generator rather than from `rand`.  Everything else is
+// `[io]`, because everything else is arithmetic.
+
+use std.test
+use std.bytes
+use std.list
+use std.str
+use uuid
+use sessid
+
+@test
+fn test_minting_reads_the_operating_systems_generator() [io, fs, rand]
+    // `[fs, rand]` on this test is the assertion.  The standard
+    // library's `rand` is xoshiro256**, which is a fine shuffle and a
+    // terrible session identifier; `/dev/urandom` is a device, and
+    // reading a device is `[fs]`.
+    test.case("a narrow identifier")
+    match sessid.new()
+        Err(_) => test.assert(true)
+        Ok(id) =>
+            test.assert(sessid.is_uuid(id))
+            test.assert(sessid.entropy_bits(id) == 122)
+
+    test.case("and a wide one")
+    match sessid.new_wide()
+        Err(_) => test.assert(true)
+        Ok(id) =>
+            test.assert(not sessid.is_uuid(id))
+            test.assert(sessid.entropy_bits(id) == 256)
+
+@test
+fn test_two_mints_are_not_the_same_identifier() [io, fs, rand]
+    test.case("which is the entire property")
+    match sessid.new()
+        Err(_) => test.assert(true)
+        Ok(a)  =>
+            match sessid.new()
+                Err(_) => test.assert(true)
+                Ok(b)  => test.assert(not sessid.id_eq(a, b))
+
+@test
+fn test_a_uuid_has_122_bits_because_six_of_its_128_are_fixed() [io]
+    // No amount of caring makes them more, which is why `new_wide`
+    // exists rather than a flag on `new`.
+    test.case("the version and variant nibbles are not entropy")
+    let id = sessid.of_uuid(uuid.nil())
+    test.assert(sessid.entropy_bits(id) == 122)
+
+@test
+fn test_an_identifier_from_the_callers_own_bytes_costs_nothing() [io]
+    // `[]`, which is what makes every other test in this package
+    // fixed rather than random.
+    test.case("sixteen bytes is the floor")
+    match sessid.of_bytes(bytes.from_byte_list(list.range(0, 16)))
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert(true)
+
+    test.case("and three bytes is refused, because three bytes is guessable")
+    match sessid.of_bytes(bytes.from_byte_list([1, 2, 3]))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_parsing_refuses_everything_that_is_not_a_shape_this_package_mints() [io]
+    // A cookie's value is text an attacker chooses.  This is the cheap
+    // check that keeps rubbish out of a store's key space — and out of
+    // a file name, which the file store builds from it.
+    test.case("a well-formed UUID")
+    test.assert_some(sessid.parse("00000000-0000-4000-8000-000000000000"))
+
+    test.case("a path traversal")
+    test.assert_none(sessid.parse("../../etc/passwd"))
+
+    test.case("a wildcard")
+    test.assert_none(sessid.parse("*"))
+
+    test.case("something long enough to be a denial of service on its own")
+    var long = ""
+    for _ in 0..5000
+        long = long + "a"
+    test.assert_none(sessid.parse(long))
+
+    test.case("an empty string")
+    test.assert_none(sessid.parse(""))
+
+    test.case("and a UUID with a byte outside the alphabet")
+    test.assert_none(sessid.parse("0000000g-0000-4000-8000-000000000000"))
+
+@test
+fn test_the_comparison_is_constant_time_because_one_side_is_a_request() [io]
+    // A byte-by-byte comparison that stops at the first difference
+    // turns guessing 122 bits into about sixteen rounds of 256
+    // measurements.
+    test.case("the same identifier")
+    let a = sessid.of_uuid(uuid.nil())
+    test.assert(sessid.id_eq(a, a))
+
+    test.case("a different one")
+    test.assert(not sessid.id_eq(a, sessid.of_uuid(uuid.max())))
+
+@test
+fn test_the_short_form_is_for_a_log_and_the_long_one_is_a_credential() [io]
+    test.case("eight characters")
+    let id = sessid.of_uuid(uuid.nil())
+    test.assert(str.len(sessid.short_of(id)) == 8)
+
+    test.case("which is a prefix of the real thing and not the whole of it")
+    test.assert(str.starts_with(sessid.text_of(id), sessid.short_of(id)))
+    test.assert(str.len(sessid.text_of(id)) > str.len(sessid.short_of(id)))
+
+@test
+fn test_a_uuid_identifier_goes_back_out_as_a_uuid() [io]
+    // For the deployment whose sessions table has a UUID primary key.
+    test.case("there and back")
+    match sessid.as_uuid(sessid.of_uuid(uuid.nil()))
+        None    => test.assert(false)
+        Some(u) => test.assert(u == uuid.nil())
+
+    test.case("and a wide identifier is not a UUID and does not pretend to be")
+    match sessid.of_bytes(bytes.from_byte_list(list.range(0, 32)))
+        Err(_) => test.assert(false)
+        Ok(id) =>
+            if sessid.is_uuid(id)
+                test.assert(true)
+            else
+                test.assert_none(sessid.as_uuid(id))

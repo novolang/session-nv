@@ -1,0 +1,850 @@
+// sess.nv — the session itself: a bag of strings, a change state, and
+// two clocks it does not read.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SESSION KNOWS WHETHER IT CHANGED, and that is not tidiness.  A
+// middleware that saves after every request writes the store on every
+// request — including the ones that only READ the session, which is
+// almost all of them.  On a memory store that is free; on a file store
+// it is a write per page view; on a database it is the query that
+// makes somebody move the sessions table to its own machine.  So
+// `SessChange` is a field, every mutator sets it, and `sessmw` saves
+// only when it says to.
+//
+// TWO TIMEOUTS, NOT ONE, AND THEY ANSWER DIFFERENT QUESTIONS.  An IDLE
+// timeout ends a session that has not been used; an ABSOLUTE timeout
+// ends one that has been used constantly since it was created.  A
+// deployment with only the first can be kept alive forever by a stolen
+// cookie in an automated loop, which is precisely the session an
+// attacker has.  `SessPolicy` carries both, `is_expired` checks both,
+// and `check_policy` refuses the combination where the absolute
+// lifetime is shorter than the idle one — a configuration that cannot
+// do anything.
+//
+// ROTATION IS A FUNCTION, NOT A FLAG.  `rotate` answers a session with
+// the same data under a NEW identifier, and the old one is deleted.
+// It is what has to happen the moment a session's privilege changes —
+// a sign-in, a step up to an administrative role, the acceptance of an
+// invitation — because otherwise an attacker who fixed a known
+// identifier in somebody's browser BEFORE they signed in owns the
+// session AFTER they did.  That is session fixation, it is thirty
+// years old, and the reason it survives is that the fix is a step
+// every framework makes optional.
+//
+// FLASH MESSAGES ARE CONSUMED BY READING, which is the only shape that
+// works.  A flash is "show this once, on the next page" — after a
+// redirect, which is a second request.  A reader that did not remove
+// the message leaves it for the request after that, and the person
+// sees "Saved." twice.  So `take_flash` empties, `peek_flash` does
+// not, and the names say which is which.
+
+use civil
+use sesserr
+use sessid
+
+// Whether a session has changed since it was loaded, and how.
+//
+// The middleware reads this to decide whether to write anything.
+pub enum SessChange
+    // Loaded and untouched.  Nothing to save.
+    SessUnchanged
+    // A value was set, removed, or a flash was consumed.  Save it.
+    SessDirty
+    // Created during this request and never stored.  Save it, and send
+    // a cookie.
+    SessFresh
+    // Rotated during this request: a new identifier holds the old
+    // data.  Save the new record, DELETE the old one, and send a
+    // cookie.
+    SessRotated(previous: sessid.SessId)
+    // Destroyed during this request.  Delete the record and send a
+    // cookie that expires immediately.
+    SessDestroyed(previous: sessid.SessId)
+
+// The two timeouts and the ceiling, as one value.
+pub struct SessPolicy
+    // Seconds of inactivity after which a session ends.  Zero for no
+    // idle timeout, which is a choice and not a default.
+    idle_secs: Int
+    // Seconds after creation, however active.  Zero for none — and a
+    // deployment with no absolute timeout has sessions that a stolen
+    // cookie in a loop keeps alive forever.
+    absolute_secs: Int
+    // The largest a client-side session may serialise to, in bytes.
+    // 4096 by default, which is RFC 6265 § 6.1's per-cookie floor and
+    // every browser's maximum.
+    cookie_ceiling: Int
+    // Whether a session is written back when nothing changed.  False,
+    // and the field exists so a deployment that must refresh an idle
+    // timeout on every request can say so out loud.
+    save_unchanged: Bool
+
+// A session: the data, the identifier, when it was born, when it was
+// last used, and whether it changed.
+pub struct Sess
+    // The identifier a cookie carries.
+    id: sessid.SessId
+    // The values, as string pairs.  Strings on purpose — a session is
+    // serialised into a store and out again, and a typed bag would
+    // make this package a serialisation framework.  A caller with
+    // structure puts JSON in a value and says so.
+    values: [(Str, Str)]
+    // Flash messages, consumed by reading.
+    flashes: [(Str, Str)]
+    // When the session was created, for the absolute timeout.
+    created_at: civil.CivilDateTime
+    // When it was last seen, for the idle timeout.
+    seen_at: civil.CivilDateTime
+    // Whether anything changed this request.
+    change: SessChange
+
+// What a store holds: a session, flattened.
+//
+// Separate from `Sess` because a store round-trips BYTES and a session
+// is a value a handler holds; keeping them apart is what lets a store
+// be swapped without touching a handler.
+pub struct SessRecord
+    // The key.
+    id: sessid.SessId
+    // The serialised session.
+    payload: Str
+    // When the store may forget this row, so a store with its own
+    // expiry — a cache, a database with a TTL column — can use it
+    // rather than running a sweep.
+    expires_at: civil.CivilDateTime
+
+// The conventional policy: a thirty-minute idle timeout, a twelve-hour
+// absolute one, and the browser's cookie ceiling.
+//
+// Both numbers are what a session for an ordinary application wants;
+// a bank wants smaller and a forum wants larger, and both say so by
+// building their own.
+//
+// ```novo
+// use sess
+//
+// fn main() [io]
+//     println("${sess.defaults().idle_secs}")
+// ```
+pub fn defaults() -> SessPolicy []
+    todo("session-nv.sess.defaults")
+
+// A policy with the timeouts a caller chose.
+//
+// ```novo
+// use sess
+//
+// fn main() [io]
+//     println("${sess.policy(900, 28800).absolute_secs}")
+// ```
+pub fn policy(idle_secs: Int, absolute_secs: Int) -> SessPolicy []
+    todo("session-nv.sess.policy")
+
+// Whether a policy can do anything at all.
+//
+// `None` when it can.  Refuses the one combination that cannot: an
+// absolute lifetime shorter than the idle timeout, under which a
+// session expires before it can ever be refreshed and every end user
+// is logged out mid-task.  Caught where the policy is written rather
+// than in production.
+//
+// ```novo
+// use sess
+//
+// fn main() [io]
+//     match sess.check_policy(sess.policy(3600, 600))
+//         Some(_) => println("that policy cannot work")
+//         None    => println("fine")
+// ```
+pub fn check_policy(p: SessPolicy) -> ?sesserr.SessFault []
+    todo("session-nv.sess.check_policy")
+
+// A brand-new empty session.
+//
+// `SessFresh`, so the middleware knows to store it and to send a
+// cookie.  The identifier is minted by the caller — `sessid.new` —
+// which is what keeps this function `[]`.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+//
+// fn main() [io]
+//     match sessid.parse("00000000-0000-4000-8000-000000000000")
+//         None     => println("no")
+//         Some(id) =>
+//             match civil.date(2026, 9, 12)
+//                 Err(_) => println("no")
+//                 Ok(d)  =>
+//                     let s = sess.fresh(id, civil.datetime(d, civil.midnight()))
+//                     println("${sess.is_fresh(s)}")
+// ```
+pub fn fresh(id: sessid.SessId, now: civil.CivilDateTime) -> Sess []
+    todo("session-nv.sess.fresh")
+
+// A session rebuilt from a store's record.
+//
+// `SessUnchanged`, so a request that only reads it writes nothing.
+// Refuses a payload that is not the shape `to_record` writes.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn a_record() -> sess.SessRecord
+//     sess.to_record(a_session(), sess.defaults(), a_moment())
+//
+// fn main() [io]
+//     match sess.of_record(a_record())
+//         Ok(s)  => println("${sess.len(s)}")
+//         Err(_) => println("that record is not readable")
+// ```
+pub fn of_record(r: SessRecord) -> Result<Sess, sesserr.SessFault> []
+    todo("session-nv.sess.of_record")
+
+// A session flattened into a store's record.
+//
+// `expires_at` is computed from the policy and the time the caller
+// passes in, so a store with its own expiry can use it.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println(sess.to_record(a_session(), sess.defaults(), a_moment()).payload)
+// ```
+pub fn to_record(s: Sess, p: SessPolicy, now: civil.CivilDateTime) -> SessRecord []
+    todo("session-nv.sess.to_record")
+
+// ── Reading and writing values ───────────────────────────────────────
+
+// A value, or `None`.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     match sess.get(a_session(), "user_id")
+//         Some(v) => println(v)
+//         None    => println("not signed in")
+// ```
+pub fn get(s: Sess, key: Str) -> ?Str []
+    todo("session-nv.sess.get")
+
+// A value, or a fallback.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println(sess.get_or(a_session(), "theme", "light"))
+// ```
+pub fn get_or(s: Sess, key: Str, fallback: Str) -> Str []
+    todo("session-nv.sess.get_or")
+
+// Whether a key is present.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.has(a_session(), "user_id")}")
+// ```
+pub fn has(s: Sess, key: Str) -> Bool []
+    todo("session-nv.sess.has")
+
+// A session with a value set.
+//
+// Marks the session dirty — UNLESS the value is the one already there,
+// which is the case that matters: a handler that writes the same
+// `theme` on every request would otherwise make every request a store
+// write.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.is_dirty(sess.set(a_session(), "theme", "dark"))}")
+// ```
+pub fn set(s: Sess, key: Str, value: Str) -> Sess []
+    todo("session-nv.sess.set")
+
+// A session with a key removed.
+//
+// Marks it dirty only where the key was there.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.len(sess.remove(a_session(), "theme"))}")
+// ```
+pub fn remove(s: Sess, key: Str) -> Sess []
+    todo("session-nv.sess.remove")
+
+// Every key, for a caller inspecting a session.
+//
+// ```novo
+// use std.list
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${list.len(sess.keys(a_session()))}")
+// ```
+pub fn keys(s: Sess) -> [Str] []
+    todo("session-nv.sess.keys")
+
+// How many values the session holds.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.len(a_session())}")
+// ```
+pub fn len(s: Sess) -> Int []
+    todo("session-nv.sess.len")
+
+// A session with every value removed, keeping the identifier.
+//
+// NOT a sign-out: the identifier survives, so an attacker who knew it
+// still knows it.  `destroy` and `rotate` are the two that change it,
+// and the distinction is why this is named `clear` rather than
+// `reset`.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.len(sess.clear(a_session()))}")
+// ```
+pub fn clear(s: Sess) -> Sess []
+    todo("session-nv.sess.clear")
+
+// ── Flash messages ───────────────────────────────────────────────────
+
+// A session with a flash message added.
+//
+// A flash is shown once, on the next page — which after a redirect is
+// a second request.  The convention for the key is a severity
+// (`info`, `error`) and several messages may share one.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     let s = sess.flash(a_session(), "info", "Saved.")
+//     println("${sess.flash_count(s)}")
+// ```
+pub fn flash(s: Sess, key: Str, message: Str) -> Sess []
+    todo("session-nv.sess.flash")
+
+// The messages under a key, REMOVING them.
+//
+// The one a template calls.  A reader that did not remove them leaves
+// them for the request after, and the person sees "Saved." twice — on
+// a page they did not save anything from.
+//
+// ```novo
+// use std.list
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     let (s2, msgs) = sess.take_flash(a_session(), "info")
+//     println("${list.len(msgs)} ${sess.flash_count(s2)}")
+// ```
+pub fn take_flash(s: Sess, key: Str) -> (Sess, [Str]) []
+    todo("session-nv.sess.take_flash")
+
+// Every flash message, REMOVING them all.
+//
+// What a layout template calls when it renders all severities at once.
+//
+// ```novo
+// use std.list
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     let (s2, all) = sess.take_all_flashes(a_session())
+//     println("${list.len(all)} ${sess.flash_count(s2)}")
+// ```
+pub fn take_all_flashes(s: Sess) -> (Sess, [(Str, Str)]) []
+    todo("session-nv.sess.take_all_flashes")
+
+// The messages under a key, WITHOUT removing them.
+//
+// For a handler deciding whether there is anything to show before it
+// picks a template.  Named `peek` so the difference from `take` is
+// visible at the call site rather than in a doc comment.
+//
+// ```novo
+// use std.list
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${list.len(sess.peek_flash(a_session(), "info"))}")
+// ```
+pub fn peek_flash(s: Sess, key: Str) -> [Str] []
+    todo("session-nv.sess.peek_flash")
+
+// How many flash messages are waiting.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.flash_count(a_session())}")
+// ```
+pub fn flash_count(s: Sess) -> Int []
+    todo("session-nv.sess.flash_count")
+
+// ── Identity changes ─────────────────────────────────────────────────
+
+// A session with the same data under a NEW identifier.
+//
+// **Call this the moment a session's privilege changes** — a sign-in, a
+// step up to an administrative role, the acceptance of an invitation.
+// Without it, an attacker who planted a known identifier in somebody's
+// browser before they signed in holds an authenticated session after
+// they did.  That is session fixation; it is thirty years old; it
+// survives because the fix is a step every framework makes optional.
+//
+// The change becomes `SessRotated`, carrying the OLD identifier, so
+// the middleware deletes the old record as well as writing the new
+// one. Leaving it behind would keep the fixed session alive.
+//
+// The new identifier is minted by the caller — `sessid.new` — which is
+// what keeps this `[]` and testable.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     match sessid.parse("11111111-1111-4111-8111-111111111111")
+//         None     => println("no")
+//         Some(id) => println("${sess.was_rotated(sess.rotate(a_session(), id))}")
+// ```
+pub fn rotate(s: Sess, new_id: sessid.SessId) -> Sess []
+    todo("session-nv.sess.rotate")
+
+// A session marked for deletion.
+//
+// A sign-out: the record goes and the cookie is expired.  The change
+// carries the identifier so the middleware knows what to delete.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.was_destroyed(sess.destroy(a_session()))}")
+// ```
+pub fn destroy(s: Sess) -> Sess []
+    todo("session-nv.sess.destroy")
+
+// A session whose `seen_at` is now.
+//
+// What refreshes an idle timeout.  Does NOT mark the session dirty by
+// itself, because a touch on every request is exactly the write the
+// change state exists to avoid; `SessPolicy.save_unchanged` is how a
+// deployment that needs the refresh persisted says so.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.is_dirty(sess.touch(a_session(), a_moment()))}")
+// ```
+pub fn touch(s: Sess, now: civil.CivilDateTime) -> Sess []
+    todo("session-nv.sess.touch")
+
+// ── Questions about the change state ─────────────────────────────────
+
+// Whether anything about this session has to reach the sessions.
+//
+// What `sessmw` branches on.  True for every state but
+// `SessUnchanged`, and for that one too when the policy says
+// `save_unchanged`.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.needs_save(a_session(), sess.defaults())}")
+// ```
+pub fn needs_save(s: Sess, p: SessPolicy) -> Bool []
+    todo("session-nv.sess.needs_save")
+
+// Whether the response has to carry a `Set-Cookie`.
+//
+// True for a fresh, rotated or destroyed session and false otherwise —
+// a cookie re-sent on every request is bytes on every response and a
+// `Set-Cookie` that defeats a cache.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.needs_cookie(a_session())}")
+// ```
+pub fn needs_cookie(s: Sess) -> Bool []
+    todo("session-nv.sess.needs_cookie")
+
+// Whether a record under a previous identifier has to be deleted.
+//
+// `Some` after a rotation or a destruction, and the identifier is the
+// old one.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     match sess.superseded(a_session())
+//         Some(_) => println("delete the old record")
+//         None    => println("nothing to clean up")
+// ```
+pub fn superseded(s: Sess) -> ?sessid.SessId []
+    todo("session-nv.sess.superseded")
+
+// Whether the session was created during this request.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.is_fresh(a_session())}")
+// ```
+pub fn is_fresh(s: Sess) -> Bool []
+    todo("session-nv.sess.is_fresh")
+
+// Whether a value changed during this request.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.is_dirty(a_session())}")
+// ```
+pub fn is_dirty(s: Sess) -> Bool []
+    todo("session-nv.sess.is_dirty")
+
+// Whether the identifier was rotated during this request.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.was_rotated(a_session())}")
+// ```
+pub fn was_rotated(s: Sess) -> Bool []
+    todo("session-nv.sess.was_rotated")
+
+// Whether the session was destroyed during this request.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.was_destroyed(a_session())}")
+// ```
+pub fn was_destroyed(s: Sess) -> Bool []
+    todo("session-nv.sess.was_destroyed")
+
+// ── Expiry ───────────────────────────────────────────────────────────
+
+// Whether a session has ended under a policy, at a time the caller
+// supplies.
+//
+// Checks BOTH timeouts.  A deployment with only the idle one has
+// sessions a stolen cookie in an automated loop keeps alive forever,
+// which is exactly the session an attacker has.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.is_expired(a_session(), sess.defaults(), a_moment())}")
+// ```
+pub fn is_expired(s: Sess, p: SessPolicy, now: civil.CivilDateTime) -> Bool []
+    todo("session-nv.sess.is_expired")
+
+// WHICH timeout ended it: `idle`, `absolute`, or empty where it has
+// not ended.
+//
+// For the log line an operator reads when people complain about being
+// logged out.  The two have different fixes and a message that says
+// only "session expired" does not tell them apart.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println(sess.expiry_reason(a_session(), sess.defaults(), a_moment()))
+// ```
+pub fn expiry_reason(s: Sess, p: SessPolicy, now: civil.CivilDateTime) -> Str []
+    todo("session-nv.sess.expiry_reason")
+
+// When the session ends: the earlier of the two timeouts.
+//
+// What goes in a record's `expires_at` and in a cookie's `Max-Age`.
+//
+// ```novo
+// use civil
+// use sess
+// use sessid
+// use uuid
+//
+// fn a_moment() -> civil.CivilDateTime
+//     civil.datetime(civil.date_from_epoch_day(20000), civil.midnight())
+//
+// fn a_session() -> sess.Sess
+//     sess.fresh(sessid.of_uuid(uuid.nil()), a_moment())
+//
+// fn main() [io]
+//     println("${sess.expires_at(a_session(), sess.defaults()).date.year}")
+// ```
+pub fn expires_at(s: Sess, p: SessPolicy) -> civil.CivilDateTime []
+    todo("session-nv.sess.expires_at")

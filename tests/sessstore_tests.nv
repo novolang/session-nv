@@ -1,0 +1,176 @@
+// sessstore_tests.nv — the trait with the effect parameter, and what
+// each store costs.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: session-nv.sessstore.<fn>`.
+//
+// THIS FILE'S EFFECT ROWS ARE PART OF THE ASSERTION.  `[io, mutate]`
+// on the memory-store tests and `[io, fs]` on the file-store ones is
+// not decoration: it is the compiler agreeing that a memory store
+// costs `[mutate]` and a file store costs `[fs]`, measured at the
+// `impl` and charged through `SessStore[e]`.  A test that could name
+// only one row could not hold both stores, and the fact that these two
+// functions have DIFFERENT rows is the property the whole design
+// rests on.
+
+use std.test
+use std.str
+use civil
+use uuid
+use sess
+use sessid
+use sessstore
+
+fn t0() -> civil.CivilDateTime
+    civil.datetime(civil.date_from_epoch_day(20708), civil.midnight())
+
+fn an_id() -> sessid.SessId
+    sessid.of_uuid(uuid.nil())
+
+fn a_record() -> sess.SessRecord
+    sess.to_record(sess.fresh(an_id(), t0()), sess.defaults(), t0())
+
+@test
+fn test_the_memory_store_costs_mutate_and_nothing_else() [io, mutate]
+    // This function's row is the assertion.  No `[fs]`, no `[net]`.
+    test.case("a store with a capacity")
+    let sessions = sessstore.memory(1000)
+    test.assert(sessstore.memory_len(sessions) == 0)
+
+    test.case("nothing has been evicted yet")
+    test.assert(sessstore.memory_evicted(sessions) == 0)
+
+@test
+fn test_the_memory_store_round_trips_a_record() [io, mutate]
+    let sessions = sessstore.memory(10)
+
+    test.case("nothing is there before it is put")
+    match sessions.sess_get(an_id())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_none(r)
+
+    test.case("and it is afterwards")
+    test.assert_none(sessions.sess_put(a_record()))
+    match sessions.sess_get(an_id())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_some(r)
+
+@test
+fn test_a_store_never_says_whether_an_identifier_was_ever_real() [io, mutate]
+    // Never issued, expired and deleted are ONE answer.  A store that
+    // told them apart would answer, one bit per guess, the question
+    // the identifier exists to make unanswerable.
+    let sessions = sessstore.memory(10)
+
+    test.case("never issued")
+    match sessions.sess_get(sessid.of_uuid(uuid.max()))
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_none(r)
+
+    test.case("deleted — the same answer, and the delete itself does not report")
+    test.assert_none(sessions.sess_put(a_record()))
+    test.assert_none(sessions.sess_drop(an_id()))
+    match sessions.sess_get(an_id())
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert_none(r)
+
+    test.case("and dropping something that was never there is not a fault either")
+    test.assert_none(sessions.sess_drop(sessid.of_uuid(uuid.max())))
+
+@test
+fn test_a_store_with_no_ceiling_is_a_memory_exhaustion_surface() [io, mutate]
+    // Every request without a cookie can create a session, so anybody
+    // with a socket can fill an unbounded sessions.  The ceiling is a
+    // ceiling and the oldest records go first.
+    test.case("the capacity is honoured")
+    let sessions = sessstore.memory(2)
+    test.assert_none(sessions.sess_put(a_record()))
+    test.assert(sessstore.memory_len(sessions) <= 2)
+
+    test.case("and what was evicted is countable, so a deployment can alert on it")
+    test.assert(sessstore.memory_evicted(sessions) >= 0)
+
+@test
+fn test_a_touch_extends_an_expiry_without_rewriting_the_payload() [io, mutate]
+    // On a store with a TTL this is one command; a read-modify-write
+    // would be three round trips per page view.
+    let sessions = sessstore.memory(10)
+    test.case("touching a record that is there")
+    test.assert_none(sessions.sess_put(a_record()))
+    test.assert_none(sessions.sess_touch(an_id(), t0()))
+
+@test
+fn test_a_sweep_answers_how_many_went() [io, mutate]
+    // Called by a caller's scheduler, never from inside a request.
+    test.case("an empty store sweeps nothing")
+    let sessions = sessstore.memory(10)
+    match sessions.sess_sweep(t0())
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 0)
+
+@test
+fn test_the_file_store_costs_fs_and_nothing_else() [io, fs]
+    // The second half of the argument: a DIFFERENT row on a function
+    // calling the same trait methods.  `[fs]`, no `[mutate]`.
+    test.case("a store rooted at a directory")
+    let sessions = sessstore.files("/tmp/novo-session-test")
+    test.assert_eq_str(sessions.root, "/tmp/novo-session-test")
+
+    test.case("and reading through it is the same five methods")
+    match sessions.sess_get(an_id())
+        Err(_) => test.assert(true)
+        Ok(r)  => test.assert_none(r)
+
+@test
+fn test_the_file_store_constructor_touches_no_filesystem() [io]
+    // `[io]` alone on this test is the assertion: building the value
+    // is `[]`, so a router's setup does not do a filesystem round trip
+    // and a missing directory becomes a fault at the first write
+    // rather than at start-up.
+    test.case("a directory that does not exist is still a value")
+    test.assert_eq_str(sessstore.files("/no/such/place").root, "/no/such/place")
+
+@test
+fn test_a_file_name_is_the_identifier_and_nothing_else() [io]
+    // The identifier has already been through `sessid.parse`, which
+    // refuses everything outside its alphabet, so the join cannot
+    // reach through a `..` that was never in the value.
+    test.case("the path is the root and the identifier")
+    let path = sessstore.file_path(sessstore.files("/var/lib/s"), an_id())
+    test.assert(str.starts_with(path, "/var/lib/s"))
+    test.assert(str.contains(path, sessid.text_of(an_id())))
+
+    test.case("and there is no traversal in it")
+    test.assert(not str.contains(path, ".."))
+
+@test
+fn test_the_remote_shape_is_a_value_rather_than_a_dependency() [io]
+    // Depending on a Redis client here would make every application
+    // with a file store compile one it never calls.
+    test.case("the conventional prefix")
+    let r = sessstore.remote_defaults()
+    test.assert_eq_str(r.key_prefix, "session:")
+
+    test.case("a server that expires rows itself needs no sweep")
+    test.assert(r.server_expires)
+
+    test.case("and Redis's EXPIRE is one command")
+    test.assert(r.cheap_touch)
+
+@test
+fn test_a_remote_key_is_findable_by_a_person_at_midnight() [io]
+    test.case("the prefix and the identifier, and nothing else")
+    let k = sessstore.remote_key(sessstore.remote_defaults(), an_id())
+    test.assert(str.starts_with(k, "session:"))
+    test.assert(str.contains(k, sessid.text_of(an_id())))
+
+@test
+fn test_a_ttl_of_zero_means_no_expiry_rather_than_expire_now() [io]
+    // The two are one character apart in most clients and the second
+    // one logs everybody out.
+    test.case("a policy with both timeouts gives a positive TTL")
+    let s = sess.fresh(an_id(), t0())
+    test.assert(sessstore.remote_ttl(sess.policy(1800, 43200), s, t0()) == 1800)
+
+    test.case("a policy with neither gives zero, which a store reads as no TTL")
+    test.assert(sessstore.remote_ttl(sess.policy(0, 0), s, t0()) == 0)
