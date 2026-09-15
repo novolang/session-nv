@@ -5,6 +5,10 @@ All notable changes to session-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-12
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -55,3 +59,26 @@ The **interface**: every signature and every effect row, and no bodies.
 - No Redis or database store ships.  `SessRemote` is the shape one
   takes; writing one is about twenty lines against a client the
   deployment already has.
+
+### Design notes
+
+The store trait carries an effect parameter rather than declaring the
+union of what every store might cost. The union, `[fs, net, mutate]`,
+would make every application that mounts the memory store in a test
+declare two effects for a store that touches neither, which turns the
+row from a description into a ceiling. Three unrelated interfaces would
+make swapping a store a rewrite instead.
+
+The middleware is two functions because a wrapper of the form
+`fn(handler) -> handler` has nowhere to put the session. Threading it
+through a request field would mean editing the standard library's
+`HttpRequest`. Holding it in a cell keyed by a request identifier would
+give the session layer mutable global state with a lifetime nobody can
+see. An explicit value makes the handler's signature say it takes a
+session.
+
+The novo-lang registry authenticates publishes with a bearer token
+rather than a session, which is right for a command-line tool that has
+no browser, no cookie jar and no redirect to come back from. The half
+of the registry this package would fit is a person signing in on its
+web pages, which has all three and has a privilege change at sign-in.

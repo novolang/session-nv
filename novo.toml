@@ -1,6 +1,6 @@
 [package]
 name        = "session-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "Sessions for a web application: a store trait with an effect parameter, so a memory store costs [mutate] and a file store costs [fs] and the middleware costs whichever one you mounted.  Signed-cookie and store-backed sessions behind one interface, with rotation on privilege change.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
